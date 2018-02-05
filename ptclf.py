@@ -3,6 +3,7 @@
 import os
 from datetime import datetime
 
+import pickle
 from comet_ml import Experiment
 
 COMET_API_KEY = os.environ.get('COMET_API_KEY')
@@ -39,15 +40,22 @@ class WordRnn(nn.Module):
         self.cuda = args.cuda
         self.seqlen = args.maxlen
         self.num_classes = len(args.classes.split(','))
+        self.bidirectional = args.bidirectional
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
+        self.embed_dropout = nn.Dropout(args.embeddropout)
+
         if self.rnn_kind == 'gru':
-           self.rnn = nn.GRU(self.embed_size, self.context_size, self.rnn_layers)
+           self.rnn = nn.GRU(self.embed_size, self.context_size, self.rnn_layers,
+                             bidirectional=args.bidirectional)
         elif self.rnn_kind == 'lstm':
-           self.rnn = nn.LSTM(self.embed_size, self.context_size, self.rnn_layers)
+           self.rnn = nn.LSTM(self.embed_size, self.context_size, self.rnn_layers,
+                              bidirectional=args.bidirectional)
         else:
            raise RuntimeError('Got invalid rnn type: {}'.format(self.rnn_kind))
-        self.dense = nn.Linear(self.context_size, self.num_classes)
+
+        self.rnn_dropout = nn.Dropout(args.rnndropout)
+        self.dense = nn.Linear(self.context_size * (1 + int(self.bidirectional)), self.num_classes)
         
         if self.cuda:
             self.embedding.cuda()
@@ -71,10 +79,10 @@ class WordRnn(nn.Module):
         # hidden state shape: (rnn_depth, batch_size, context_size)
         batch_size = input_tensor.size(1)
         hidden_state = self.init_hidden(batch_size)
-        embedded = self.embedding(input_tensor)
+        embedded = self.embed_dropout(self.embedding(input_tensor))
         # embedded shape: (msg_len, batch_size, embed_size)
         context, hidden = self.rnn(embedded, hidden_state)
-        last_context = context[-1]
+        last_context = self.rnn_dropout(context)[-1]
         # context shape: (msg_len, batch_size, context_size)
         # hidden shape: (rnn_depth, batch_size, context_size)
         dense = self.dense(last_context)
@@ -85,11 +93,12 @@ class WordRnn(nn.Module):
 
     def init_hidden(self, batch_size):
         if self.rnn_kind == 'gru':
-            hidden = torch.zeros(self.rnn_layers, batch_size, self.context_size)
+            hidden = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)),
+                                 batch_size, self.context_size)
             return Variable(hidden.cuda()) if self.cuda else Variable(hidden)
         elif self.rnn_kind == 'lstm':
-            hidden1 = torch.zeros(self.rnn_layers, batch_size, self.context_size)
-            hidden2 = torch.zeros(self.rnn_layers, batch_size, self.context_size)
+            hidden1 = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)), batch_size, self.context_size)
+            hidden2 = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)), batch_size, self.context_size)
             return (Variable(hidden1.cuda()), Variable(hidden2.cuda())) if self.cuda else \
                     (Variable(hidden1), Variable(hidden2))
 
@@ -113,16 +122,26 @@ def parse_args():
     parser.add_argument('-b', '--batchsize', type=int, default=env('BATCHSIZE', 16, int))
     parser.add_argument('--cuda', action='store_true',
                         default=env('CUDA', 'False', lambda s: s.lower() == 'true'))
+    parser.add_argument('--verbose', type=int, default=env('VERBOSE', 1, int),
+                        help='Verbosity of model. 0 = silent, 1 = progress bar, 2 = one line '
+                             'per epoch.')
 
     parser.add_argument('--lr', type=float, default=env('LR', 0.005, float))
     parser.add_argument('--optim', type=str, default=env('OPTIM', 'adam', str),
                         help='One of {sgd, adam}')
     parser.add_argument('--loss', type=str, default=env('LOSS', 'CrossEntropy', str))
+    parser.add_argument('--embeddropout', type=float, default=env('EMBEDDROPOUT', 0.1, float),
+                        help='Dropout used for embedding layer')
+    parser.add_argument('--rnndropout', type=float, default=env('RNNDROPOUT', 0.1, float),
+                        help='Dropout used for RNN output')
 
     parser.add_argument('--rnn', type=str, default='gru',
                         help='Type of RNN used - one of {gru, lstm}')
     parser.add_argument('--rnnlayers', type=int, default=1,
                         help='Number of RNN layers to stack')
+    parser.add_argument('--bidirectional', action='store_true',
+                        default=env('BIDIRECTIONAL', 'False', lambda s: s.lower() == 'true'),
+                        help='If set, RNN is bidirectional')
     
     parser.add_argument('--charrnn', action='store_true', default=False,
                         help='Use a character RNN instead of word RNN')
@@ -139,8 +158,11 @@ def parse_args():
 
     parser.add_argument('--classes', type=str,
                         help='Comma separated list of classes to predict')
-    parser.add_argument('--classweights', type=str,
+    parser.add_argument('--classweights', type=str, default=env('CLASSWEIGHTS', None, lambda s: s),
                         help='Comma separated list of class weights')
+
+    parser.add_argument('--continued', action='store_true',
+                        help='Continue training')
 
     return parser.parse_args()
 
@@ -166,6 +188,9 @@ def args_to_comet_hparams(args):
         'char_rnn': args.charrnn,
         'vocab_size': args.vocabsize,
         'max_len': args.maxlen,
+        'embed_dropout': args.embeddropout,
+        'rnn_dropout': args.rnndropout,
+        'bidirectional': args.bidirectional,
     }
 
 
@@ -222,6 +247,17 @@ def batch_iter_from_path(args, path):
             pass
 
 
+def predict_batch_iter(args):
+    chunk_iter = iter(pandas.read_csv(args.inputpath, chunksize=args.batchsize, header=None))
+    while True:
+        try:
+            chunk = next(chunk_iter)
+            real_chunk = chunk.dropna(axis=0)
+            yield transform_texts(args, real_chunk.loc[:, 0].values)
+        except pandas.errors.ParserError:
+            pass
+
+
 def build_model(args):
     """ Builds model based on arguments provided """
     if args.charrnn:
@@ -245,8 +281,15 @@ def infer_class_weights(args):
 
 def train(args):
     """ Trains RNN based on provided arguments """
-    model = build_model(args)
-    print(predict_batch(model, transform_texts(args, ['This is great!', 'Wow, this really sucks.'])))
+    if args.continued:
+        with open(args.modelpath + '.meta', 'rb') as infile:
+            args = pickle.load(infile)
+        model = WordRnn(args)
+        model.load_state_dict(torch.load(args.modelpath + '.bin'))
+        logging.info('Model loaded from {}, continuing training'.format(args.modelpath))
+    else:
+        model = build_model(args)
+
     class_weights = torch.FloatTensor([float(w) for w in args.classweights.split(',')]) if args.classweights \
         else infer_class_weights(args)
     if args.cuda:
@@ -279,9 +322,11 @@ def train(args):
     try:
         for epoch in range(args.epochs):
             train_epoch(args, model, criterion, optimizer, epoch, comet_experiment)
-            print('\n')
-            print(predict_batch(model, transform_texts(args, ['This is great!', 'Wow, this really sucks.'])))
             score_model(args, model, criterion, epoch, comet_experiment)
+            torch.save(model.state_dict(), args.modelpath + '.bin')
+            with open(args.modelpath + '.meta', 'wb') as metafile:
+                pickle.dump(args, metafile)
+            logging.info('Model saved at {}'.format(args.modelpath))
     except KeyboardInterrupt:
         pass
 
@@ -297,14 +342,17 @@ def train_epoch(args, model, criterion, optimizer, epoch, comet_experiment):
     """ Trains a single epoch """
     comet_experiment.log_current_epoch(epoch)
     loss_queue = deque(maxlen=100)
-    progress = tqdm(desc='Epoch {}'.format(epoch))
+    all_losses = []
+    progress = tqdm(desc='Epoch {}'.format(epoch)) if args.verbose == 1 else MagicMock()
     correct = 0
     seen = 0
+    epoch_period = 1
     started = datetime.now()
 
     for step, (batch_x, batch_y) in enumerate(train_batch_iter(args)):
         output, loss = train_batch(model, criterion, optimizer, batch_x, batch_y)
         loss_queue.append(loss)
+        all_losses.append(loss)
         rolling_loss = sum(loss_queue) / len(loss_queue)
         seen += batch_x.size(1)
         correct += float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
@@ -318,6 +366,11 @@ def train_epoch(args, model, criterion, optimizer, epoch, comet_experiment):
         comet_experiment.log_accuracy(accuracy)
         epoch_period = (datetime.now() - started).total_seconds()
         comet_experiment.log_metric('train_items_per_second', seen / epoch_period)
+
+    progress.clear()
+    if args.verbose > 0:
+        logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'.format(
+            epoch, correct/seen, sum(all_losses) / len(all_losses), seen / epoch_period))
 
 
 def train_batch(model, criterion, optimizer, x, y):
@@ -347,13 +400,31 @@ def score_model(args, model, criterion, epoch, comet_experiment):
 
     comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
     comet_experiment.log_metric('dev_acc', correct / seen)
-    logging.info('Dev accuracy: {}, dev loss: {}'.format(correct/seen, sum(losses) / len(losses)))
+    if args.verbose > 0:
+        logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}'.format(
+            epoch, correct/seen, sum(losses) / len(losses)))
 
 
 def predict_batch(model, batch):
     model.zero_grad()
     output = model(batch)
     return output
+
+
+def predict(args):
+    with open(args.modelpath + '.meta', 'rb') as infile:
+        model_args = pickle.load(infile)
+        # model_args.cuda = False
+    model = WordRnn(model_args)
+    model.load_state_dict(torch.load(args.modelpath + '.bin'))
+
+    classes = model_args.classes.split(',')
+
+    for batch_x in predict_batch_iter(args):
+        output = model(batch_x.cuda()).data
+        if model_args.cuda:
+            output = output.cpu()
+        print('\n'.join(map(lambda idx: classes[idx], output.max(1)[1].numpy())))
 
 
 def main():
@@ -366,6 +437,8 @@ def main():
 
     if args.mode == 'train':
         train(args)
+    elif args.mode == 'predict':
+        predict(args)
 
 
 if __name__ == '__main__':
