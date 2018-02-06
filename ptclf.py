@@ -402,15 +402,10 @@ def batch_iter_from_path(settings, path):
                                       nrows=settings.get('limit')))
     while True:
         try:
-            super_chunk_size = 16
-            super_chunk = pandas.concat([next(chunk_iter) for _ in range(super_chunk_size)]) \
-                .sample(frac=1)
-
-            for i in range(super_chunk_size):
-                chunk = super_chunk[i * settings.batch_size:(i + 1) * settings.batch_size]
-                real_chunk = chunk.dropna(axis=0)
-                yield transform_texts(settings, real_chunk.loc[:, 0].values), \
-                        transform_classes(settings, real_chunk.loc[:, 1].values)
+            chunk = next(chunk_iter)
+            real_chunk = chunk.dropna(axis=0)
+            yield transform_texts(settings, real_chunk.loc[:, 0].values), \
+                  transform_classes(settings, real_chunk.loc[:, 1].values)
         except pandas.errors.ParserError:
             pass
 
@@ -460,6 +455,7 @@ def train(args):
         logging.info('Model loaded from {}, continuing training'.format(settings.model_path))
 
     if settings.class_weights:
+        logging.info('Class weights specified: {}'.format(settings.class_weights))
         class_weights = torch.FloatTensor(settings.class_weights)
     else:
         class_weights = infer_class_weights(settings)
