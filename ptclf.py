@@ -366,7 +366,7 @@ def dev_batch_iter(settings):
 def batch_iter_from_path(settings, path):
     """ Loads, transforms, and yields batches for training/testing/prediction """
     chunk_iter = iter(pandas.read_csv(path, chunksize=settings.batch_size, header=None,
-                                      nrows=settings.limit))
+                                      nrows=settings.get('limit')))
     while True:
         try:
             super_chunk_size = 16
