@@ -75,6 +75,16 @@ class WordRnn(nn.Module):
 
         self.init_weights()
 
+    @classmethod
+    def load(cls, settings):
+        """ Load model from provided path
+        :param Setting settings:
+        :rtype: WordRnn
+        """
+        model = cls(settings)
+        model.load_state_dict(torch.load(settings.model_path + '.bin'))
+        return model
+
     def init_weights(self):
         # Embedding weight init
         nn.init.normal(self.embedding.weight)
@@ -130,6 +140,19 @@ def load_glove(path, vocab_size, embed_dim):
                 weights[idx, :] = numpy.array(splits[1:], dtype=float)
                 remaining.remove(idx)
     return torch.from_numpy(weights)
+
+
+def load_settings_and_model(path, args=None):
+    """ Load settings and model from the specified model path
+    :param str path: model path (without .bin or .toml)
+    :param Namespace args: optional args
+    :rtype: (Settings, WordRnn)
+    """
+    settings = Settings.load(path + '.toml')
+    if args:
+        settings.add_args(args)
+    model = WordRnn.load(settings)
+    return settings, model
 
 
 def env(name, transform):
@@ -281,6 +304,9 @@ class Settings:
                 self.defaults[name] = [float(w) for w in args.class_weights.split(',')]
             elif getattr(args, name, None):
                 self.defaults[name] = getattr(args, name)
+        for name in self.transient_names:
+            if getattr(args, name, None):
+                self.transients[name] = getattr(args, name)
 
     def to_comet_hparams(self):
         """ Turns settings into dict suitable for reporting to comet_ml
@@ -570,19 +596,30 @@ def score_model(args, model, criterion, epoch, comet_experiment):
 def predict_batch(model, batch):
     model.zero_grad()
     output = model(batch)
-    return output
+    return output.cpu() if model.cuda else output
 
 
-def predict(args):
-    settings = Settings.from_args(args)
-    model = WordRnn(settings)
-    model.load_state_dict(torch.load(settings.model_path + '.bin'))
+def stdout_predict(args):
+    settings, model = load_settings_and_model(args.model_path, args)
 
     for batch_x in predict_batch_iter(settings):
-        output = model(batch_x).data
+        output = predict_batch(model, batch_x).data
         if settings.cuda:
             output = output.cpu()
         print('\n'.join(map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())))
+
+
+def predict(settings, model, texts):
+    """ Predict classifications with the provided model and settings.  Returns iter of most likely
+        classes.
+    :param Settings settings:
+    :param WordRnn model:
+    :param list texts: Texts to predict for
+    :rtype: iter
+    """
+    for batch in toolz.partition_all(settings.batch_size, texts):
+        output = predict_batch(model, transform_texts(settings, batch)).data
+        yield from map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())
 
 
 def main():
@@ -596,7 +633,10 @@ def main():
     if args.mode == 'train':
         train(args)
     elif args.mode == 'predict':
-        predict(args)
+        stdout_predict(args)
+    elif args.mode == 'predict2':
+        settings, model = load_settings_and_model('model')
+        print(list(predict(settings, model, ['This is great!', 'Sometimes things just don\'t work out.'])))
 
 
 if __name__ == '__main__':
