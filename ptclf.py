@@ -444,7 +444,7 @@ def train(args):
     elif settings.loss == 'NLL':
         criterion = nn.NLLLoss(weight=class_weights)
     else:
-        raise RuntimeError('Invalid loss value provided: {}'.format(args.loss))
+        raise RuntimeError('Invalid loss value provided: {}'.format(settings.loss))
 
     if COMET_API_KEY:
         assert COMET_PROJECT is not None, 'You must specify a comet project to use if providing' \
@@ -452,7 +452,7 @@ def train(args):
         comet_experiment = Experiment(api_key=COMET_API_KEY, project_name=COMET_PROJECT,
                                       log_code=COMET_LOG_CODE)
         comet_experiment.log_multiple_params(settings.to_comet_hparams())
-        comet_experiment.log_dataset_hash(open(args.input_path).read())
+        comet_experiment.log_dataset_hash(open(settings.input_path).read())
     else:
         comet_experiment = MagicMock()
 
@@ -470,7 +470,7 @@ def train(args):
     try:
         while True:
             next_input = input('\n> ')
-            print(predict_batch(model, transform_texts(args, [next_input])))
+            print(predict_batch(model, transform_texts(settings, [next_input])))
     except KeyboardInterrupt:
         print("\n\nBye!")
 
