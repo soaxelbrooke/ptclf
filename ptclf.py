@@ -134,12 +134,13 @@ class Settings:
     # Default values for if no setting is provided for given parameter
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 1, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
-        'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'token_regex': r'\w+|\$[\d\.]+|\S+',
+        'msg_len': 40, 'context_dim': 32, 'embed_dim': 50,
     }
 
     default_defaults = {
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
         'loss': 'CrossEntropy', 'embed_dropout': 0.1, 'context_dropout': 0.1,
+        'token_regex': r'\w+|\$[\d\.]+|\S+',
     }
 
     transient_defaults = {'verbose': 1}
@@ -165,7 +166,6 @@ class Settings:
             return self.transients.get(key, default)
         else:
             return default
-
 
     def try_defaults(self):
         """ Try to add defaults for missing settings """
@@ -244,7 +244,9 @@ class Settings:
         except FileNotFoundError:
             pass
 
-        return Settings(model_settings, defaults, transients)
+        settings = Settings(model_settings, defaults, transients)
+        settings.try_defaults()
+        return settings
 
     def add_args(self, args):
         """ Add settings command line args and env vars
@@ -329,8 +331,8 @@ def parse_args():
 
 
 @toolz.memoize
-def get_tokenizer(tokenre):
-    return RegexpTokenizer(tokenre)
+def get_tokenizer(token_regex):
+    return RegexpTokenizer(token_regex)
 
 
 def transform_texts(settings, texts):
@@ -407,8 +409,11 @@ def infer_class_weights(settings):
     logging.info('No class weights provided, inferring...')
     counts = pandas.Series({idx: 0 for idx in range(len(settings.classes))})
     for batch_x, batch_y in toolz.take(20, train_batch_iter(settings)):
-        counts += pandas.Series(batch_y.cpu().data).value_counts()
+        batch_counts = pandas.Series(batch_y.cpu().data).value_counts()
+        for idx, count in batch_counts.iteritems():
+            counts[idx] += count
 
+    assert sum(counts) > 0, "Didn't find any examples of any classes (input iterator was empty)"
     weights = torch.FloatTensor([sum(counts) / counts[c] for c in range(len(settings.classes))])
     logging.info('Inferred class weights: {}'.format(weights))
     return weights
@@ -466,13 +471,6 @@ def train(args):
             logging.info('Model saved at {}'.format(settings.model_path))
     except KeyboardInterrupt:
         pass
-
-    try:
-        while True:
-            next_input = input('\n> ')
-            print(predict_batch(model, transform_texts(settings, [next_input])))
-    except KeyboardInterrupt:
-        print("\n\nBye!")
 
 
 def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment):
@@ -554,7 +552,7 @@ def predict(args):
     model.load_state_dict(torch.load(settings.model_path + '.bin'))
 
     for batch_x in predict_batch_iter(settings):
-        output = model(batch_x.cuda()).data
+        output = model(batch_x).data
         if settings.cuda:
             output = output.cpu()
         print('\n'.join(map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())))
