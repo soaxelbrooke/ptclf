@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from uuid import uuid4
 
+import numpy
 from comet_ml import Experiment
 
 COMET_API_KEY = os.environ.get('COMET_API_KEY')
@@ -49,6 +50,10 @@ class WordRnn(nn.Module):
         self.bidirectional = settings.bidirectional
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
+        if settings.glove_path:
+            self.embedding.weight.data.copy_(load_glove(settings.glove_path, settings.vocab_size,
+                                                        self.embed_size))
+
         self.embed_dropout = nn.Dropout(settings.embed_dropout)
 
         if self.rnn_kind == 'gru':
@@ -109,6 +114,24 @@ class WordRnn(nn.Module):
                     (Variable(hidden1), Variable(hidden2))
 
 
+def load_glove(path, vocab_size, embed_dim):
+    """ Load glove embeddings specified
+    :param str path: path to load glove embeddings from
+    :rtype: torch.FloatTensor
+    """
+    logging.info('Loading GLOVE embeddings from {}'.format(path))
+    remaining = set(range(1, vocab_size))
+    weights = numpy.zeros((vocab_size, embed_dim), dtype=float)
+    with open(path) as infile:
+        for line in infile:
+            splits = line.split(' ')
+            idx = word_to_idx(vocab_size, splits[0])
+            if idx in remaining:
+                weights[idx, :] = numpy.array(splits[1:], dtype=float)
+                remaining.remove(idx)
+    return torch.from_numpy(weights)
+
+
 def env(name, transform):
     var = os.environ.get(name)
     if var is not None:
@@ -122,13 +145,13 @@ def env_flag(name):
 class Settings:
     model_param_names = {'id', 'created_at', 'rnn', 'rnn_layers', 'char_rnn', 'bidirectional',
                          'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim'}
-    default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss',
+    default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss_fn',
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
                      'model_path'}
-    transient_names = {'input_path', 'validate_path', 'verbose', 'limit'}
+    transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path'}
     comet_hparam_names = {'rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
                           'msg_len', 'context_dim', 'embed_dim', 'batch_size', 'epochs', 'cuda',
-                          'learning_rate', 'optimizer', 'loss', 'embed_dropout', 'context_dropout',
+                          'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout', 'context_dropout',
                           'token_regex', 'class_weights'}
 
     # Default values for if no setting is provided for given parameter
@@ -139,11 +162,11 @@ class Settings:
 
     default_defaults = {
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
-        'loss': 'CrossEntropy', 'embed_dropout': 0.1, 'context_dropout': 0.1,
+        'loss_fn': 'CrossEntropy', 'embed_dropout': 0.1, 'context_dropout': 0.1,
         'token_regex': r'\w+|\$[\d\.]+|\S+',
     }
 
-    transient_defaults = {'verbose': 1}
+    transient_defaults = {'verbose': 1, 'glove_path': None}
 
     def __init__(self, model_settings, defaults, transients):
         self.model_settings = model_settings
@@ -263,7 +286,7 @@ class Settings:
         """ Turns settings into dict suitable for reporting to comet_ml
         :rtype: dict
         """
-        return {name: self[name] for name in self.comet_hparam_names}
+        return {name: self.get(name) for name in self.comet_hparam_names}
 
 
 def parse_args():
@@ -291,7 +314,7 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=env('LEARNING_RATE', float))
     parser.add_argument('--optimizer', type=str, default=env('OPTIMIZER', str),
                         help='One of {sgd, adam}')
-    parser.add_argument('--loss', type=str, default=env('LOSS', str)) # TODO add help details for other loss functions
+    parser.add_argument('--loss_fn', type=str, default=env('LOSS_FN', str)) # TODO add help details for other loss functions
     parser.add_argument('--embed_dropout', type=float, default=env('EMBED_DROPOUT', float),
                         help='Dropout used for embedding layer')
     parser.add_argument('--context_dropout', type=float, default=env('CONTEXT_DROPOUT', float),
@@ -326,6 +349,7 @@ def parse_args():
 
     parser.add_argument('--continued', action='store_true', help='Continue training')
     parser.add_argument('--limit', type=int, help='Limit rows to train/test/predict')
+    parser.add_argument('--glove_path', type=str, help='Path to GLOVE embeddings to load')
 
     return parser.parse_args()
 
@@ -333,6 +357,14 @@ def parse_args():
 @toolz.memoize
 def get_tokenizer(token_regex):
     return RegexpTokenizer(token_regex)
+
+
+def word_to_idx(vocab_size, token):
+    """ Applies hashing trick to turn a word into its embedding idx
+    :param str token: tokenized word
+    :rtype: int
+    """
+    return (int(hashlib.md5(token.encode()).hexdigest(), 16) % (vocab_size - 1)) + 1
 
 
 def transform_texts(settings, texts):
@@ -344,8 +376,7 @@ def transform_texts(settings, texts):
         tokenizer = get_tokenizer(settings.token_regex)
         for row_idx, text in enumerate(texts):
             for col_idx, token in enumerate(toolz.take(settings.msg_len, tokenizer.tokenize(text))):
-                tensor[col_idx, row_idx] = (int(hashlib.md5(token.encode()).hexdigest(), 16) %
-                                            (settings.vocab_size - 1)) + 1
+                tensor[col_idx, row_idx] = word_to_idx(settings.vocab_size, token)
 
     return Variable(tensor.cuda()) if settings.cuda else Variable(tensor)
 
@@ -444,12 +475,12 @@ def train(args):
     else:
         raise RuntimeError('Invalid optim value provided: {}'.format(settings.optimizer))
 
-    if settings.loss == 'CrossEntropy':
+    if settings.loss_fn == 'CrossEntropy':
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-    elif settings.loss == 'NLL':
+    elif settings.loss_fn == 'NLL':
         criterion = nn.NLLLoss(weight=class_weights)
     else:
-        raise RuntimeError('Invalid loss value provided: {}'.format(settings.loss))
+        raise RuntimeError('Invalid loss value provided: {}'.format(settings.loss_fn))
 
     if COMET_API_KEY:
         assert COMET_PROJECT is not None, 'You must specify a comet project to use if providing' \
