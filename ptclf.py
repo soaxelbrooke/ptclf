@@ -647,7 +647,7 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         seen += batch_x.size(1)
         correct += float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
 
-    period = (datetime.now() - started).totalseconds()
+    period = (datetime.now() - started).total_seconds()
     comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
     comet_experiment.log_metric('dev_acc', correct / seen)
     if settings.verbose > 0:
