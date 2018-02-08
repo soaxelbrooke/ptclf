@@ -1,31 +1,35 @@
 #!/usr/bin/env python3.6
-
+import csv
 import os
 from datetime import datetime
 from uuid import uuid4
 
 import numpy
-from comet_ml import Experiment
 
 COMET_API_KEY = os.environ.get('COMET_API_KEY')
 COMET_PROJECT = os.environ.get('COMET_PROJECT')
 COMET_LOG_CODE = os.environ.get('COMET_LOG_CODE', '').lower() == 'true'
 
+if COMET_API_KEY:
+    from comet_ml import Experiment
+
 from unittest.mock import MagicMock
 import argparse
 import toolz
 import pandas
-import hashlib
+import mmh3
 import logging
 
 import torch
 from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
+from torch.backends import cudnn
+cudnn.benchmark = True
 
 import toml
 
-from collections import deque
+from collections import deque, Counter
 from nltk.tokenize import RegexpTokenizer
 from tqdm import tqdm
 tqdm.monitor_interval = 0  # https://github.com/tqdm/tqdm/issues/481
@@ -45,6 +49,7 @@ class WordRnn(nn.Module):
         self.rnn_kind = settings.rnn
         self.input_size = settings.vocab_size
         self.cuda = settings.cuda
+        self.gradient_clip = settings.gradient_clip
         self.seqlen = settings.msg_len
         self.num_classes = len(settings.classes)
         self.bidirectional = settings.bidirectional
@@ -56,18 +61,37 @@ class WordRnn(nn.Module):
 
         self.embed_dropout = nn.Dropout(settings.embed_dropout)
 
+        self.bidir_factor = 1 + int(self.bidirectional)
+        rnn_hidden_shape = (settings.rnn_layers * self.bidir_factor, 1, self.context_size)
+
         if self.rnn_kind == 'gru':
+            if settings.learn_rnn_init:
+                self.rnn_init_h = nn.Parameter(
+                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor), requires_grad=True)
+            else:
+                self.rnn_init_h = Variable(torch.zeros(
+                    self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
             self.rnn = nn.GRU(self.embed_size, self.context_size, self.rnn_layers,
-                              bidirectional=self.bidirectional)
+                              bidirectional=self.bidirectional, dropout=settings.context_dropout)
         elif self.rnn_kind == 'lstm':
+            if settings.learn_rnn_init:
+                self.rnn_init_h1 = nn.Parameter(
+                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor),requires_grad=True)
+                self.rnn_init_h2 = nn.Parameter(
+                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor),requires_grad=True)
+            else:
+                self.rnn_init_h1 = Variable(torch.zeros(
+                    self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
+                self.rnn_init_h2 = Variable(torch.zeros(
+                    self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
             self.rnn = nn.LSTM(self.embed_size, self.context_size, self.rnn_layers,
-                               bidirectional=self.bidirectional)
+                               bidirectional=self.bidirectional, dropout=settings.context_dropout)
         else:
             raise RuntimeError('Got invalid rnn type: {}'.format(self.rnn_kind))
 
         self.rnn_dropout = nn.Dropout(settings.context_dropout)
-        self.dense = nn.Linear(self.context_size * (1 + int(self.bidirectional)), self.num_classes)
-        
+        self.dense = nn.Linear(self.context_size * self.bidir_factor, self.num_classes)
+
         if self.cuda:
             self.embedding.cuda()
             self.rnn.cuda()
@@ -114,14 +138,12 @@ class WordRnn(nn.Module):
 
     def init_hidden(self, batch_size):
         if self.rnn_kind == 'gru':
-            hidden = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)),
-                                 batch_size, self.context_size)
-            return Variable(hidden.cuda()) if self.cuda else Variable(hidden)
+            init = self.rnn_init_h.repeat(1, batch_size, 1)
+            return init.cuda() if self.cuda else init
         elif self.rnn_kind == 'lstm':
-            hidden1 = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)), batch_size, self.context_size)
-            hidden2 = torch.zeros(self.rnn_layers * (1 + int(self.bidirectional)), batch_size, self.context_size)
-            return (Variable(hidden1.cuda()), Variable(hidden2.cuda())) if self.cuda else \
-                    (Variable(hidden1), Variable(hidden2))
+            init1 = self.rnn_init_h1.repeat(1, batch_size, 1)
+            init2 = self.rnn_init_h2.repeat(1, batch_size, 1)
+            return init1.cuda() if self.cuda else init1, init2.cuda() if self.cuda else init2
 
 
 def load_glove(path, vocab_size, embed_dim):
@@ -139,6 +161,8 @@ def load_glove(path, vocab_size, embed_dim):
             if idx in remaining:
                 weights[idx, :] = numpy.array(splits[1:], dtype=float)
                 remaining.remove(idx)
+            if len(remaining) == 0:
+                break
     return torch.from_numpy(weights)
 
 
@@ -152,6 +176,7 @@ def load_settings_and_model(path, args=None):
     if args:
         settings.add_args(args)
     model = WordRnn.load(settings)
+    model.eval()
     return settings, model
 
 
@@ -167,29 +192,31 @@ def env_flag(name):
 
 class Settings:
     model_param_names = {'id', 'created_at', 'rnn', 'rnn_layers', 'char_rnn', 'bidirectional',
-                         'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim'}
+                         'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim',
+                         'learn_rnn_init'}
     default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss_fn',
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
-                     'model_path'}
-    transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path'}
+                     'gradient_clip'}
+    transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path',
+                       'model_path', 'preload_data'}
     comet_hparam_names = {'rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
                           'msg_len', 'context_dim', 'embed_dim', 'batch_size', 'epochs', 'cuda',
-                          'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout', 'context_dropout',
-                          'token_regex', 'class_weights'}
+                          'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout',
+                          'context_dropout', 'token_regex', 'class_weights'}
 
     # Default values for if no setting is provided for given parameter
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 1, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
-        'msg_len': 40, 'context_dim': 32, 'embed_dim': 50,
+        'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
     }
 
     default_defaults = {
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
         'loss_fn': 'CrossEntropy', 'embed_dropout': 0.1, 'context_dropout': 0.1,
-        'token_regex': r'\w+|\$[\d\.]+|\S+',
+        'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None,
     }
 
-    transient_defaults = {'verbose': 1, 'glove_path': None}
+    transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False}
 
     def __init__(self, model_settings, defaults, transients):
         self.model_settings = model_settings
@@ -232,8 +259,10 @@ class Settings:
         :rtype: Settings
         """
         with open(path) as infile:
-            settings = toml.load(infile)
-        return Settings(settings['model'], settings.get('defaults', {}), {})
+            settings_dict = toml.load(infile)
+        settings = Settings(settings_dict['model'], settings_dict.get('defaults', {}), {})
+        settings.transients['model_path'] = path[:-5]
+        return settings
 
     def save(self, path):
         """ Save TOML settings to provided path.
@@ -338,6 +367,7 @@ def parse_args():
                              'per epoch.')
 
     parser.add_argument('--learning_rate', type=float, default=env('LEARNING_RATE', float))
+    parser.add_argument('--gradient_clip', type=float, default=env('GRADIENT_CLIP', float))
     parser.add_argument('--optimizer', type=str, default=env('OPTIMIZER', str),
                         help='One of {sgd, adam}')
     parser.add_argument('--loss_fn', type=str, default=env('LOSS_FN', str)) # TODO add help details for other loss functions
@@ -352,6 +382,8 @@ def parse_args():
                         help='Number of RNN layers to stack')
     parser.add_argument('--bidirectional', action='store_true', default=env_flag('BIDIRECTIONAL'),
                         help='If set, RNN is bidirectional')
+    parser.add_argument('--learn_rnn_init', action='store_true', default=env_flag('LEARN_RNN_INIT'),
+                        help='Learn RNN initial state (default inits to tensor of 0s)')
 
     parser.add_argument('--char_rnn', action='store_true',
                         help='Use a character RNN instead of word RNN')
@@ -376,6 +408,9 @@ def parse_args():
     parser.add_argument('--continued', action='store_true', help='Continue training')
     parser.add_argument('--limit', type=int, help='Limit rows to train/test/predict')
     parser.add_argument('--glove_path', type=str, help='Path to GLOVE embeddings to load')
+    parser.add_argument('--preload_data', action='store_true',
+                        help='Eagerly loads training and dev data. If CUDA selected, loads '
+                             'into GPU memory.')
 
     return parser.parse_args()
 
@@ -390,7 +425,7 @@ def word_to_idx(vocab_size, token):
     :param str token: tokenized word
     :rtype: int
     """
-    return (int(hashlib.md5(token.encode()).hexdigest(), 16) % (vocab_size - 1)) + 1
+    return (mmh3.hash(token) % (vocab_size - 1)) + 1
 
 
 def transform_texts(settings, texts):
@@ -403,7 +438,7 @@ def transform_texts(settings, texts):
         for row_idx, text in enumerate(texts):
             for col_idx, token in enumerate(toolz.take(settings.msg_len, tokenizer.tokenize(text))):
                 tensor[col_idx, row_idx] = word_to_idx(settings.vocab_size, token)
-
+    return Variable(tensor)
     return Variable(tensor.cuda()) if settings.cuda else Variable(tensor)
 
 
@@ -411,6 +446,7 @@ def transform_classes(settings, classes):
     """ Transforms classes based on provided args """
     class_dict = {cls: idx for idx, cls in enumerate(settings.classes)}
     torch_classes = torch.LongTensor([class_dict[cls] for cls in classes])
+    return Variable(torch_classes)
     return Variable(torch_classes.cuda()) if settings.cuda else Variable(torch_classes)
 
 
@@ -456,19 +492,12 @@ def build_model(settings):
         return WordRnn(settings)
 
 
-def infer_class_weights(settings):
+def count_classes(settings):
     """ Infers class weights from provided training data """
-    logging.info('No class weights provided, inferring...')
-    counts = pandas.Series({idx: 0 for idx in range(len(settings.classes))})
-    for batch_x, batch_y in toolz.take(20, train_batch_iter(settings)):
-        batch_counts = pandas.Series(batch_y.cpu().data).value_counts()
-        for idx, count in batch_counts.iteritems():
-            counts[idx] += count
-
-    assert sum(counts) > 0, "Didn't find any examples of any classes (input iterator was empty)"
-    weights = torch.FloatTensor([sum(counts) / counts[c] for c in range(len(settings.classes))])
-    logging.info('Inferred class weights: {}'.format(weights))
-    return weights
+    with open(settings.input_path) as infile:
+        rows = toolz.take(settings.get('limit', 1000000000), csv.reader(infile))
+        counts = Counter(row[1] for row in rows)
+    return counts
 
 
 def train(args):
@@ -480,11 +509,17 @@ def train(args):
         model.load_state_dict(torch.load(args.model_path + '.bin'))
         logging.info('Model loaded from {}, continuing training'.format(settings.model_path))
 
+    logging.info('Counting classes...')
+    class_counts = count_classes(settings)
     if settings.class_weights:
         logging.info('Class weights specified: {}'.format(settings.class_weights))
         class_weights = torch.FloatTensor(settings.class_weights)
     else:
-        class_weights = infer_class_weights(settings)
+        class_weights = torch.FloatTensor([sum(class_counts.values()) / class_counts[c]
+                                           for c in settings.classes])
+        assert sum(class_counts.values()) > 0, \
+            "Didn't find any examples of any classes (input iterator was empty)"
+        logging.info('Inferred class weights: {}'.format(class_weights))
         settings.defaults['class_weights'] = list(class_weights)
 
     if settings.cuda:
@@ -515,10 +550,23 @@ def train(args):
         comet_experiment = MagicMock()
 
     try:
+        if settings.preload_data:
+            train_batches = list(tqdm(train_batch_iter(settings), 
+                                      desc='Loading and transforming train batches...', 
+                                      total=int(sum(class_counts.values())/settings.batch_size)))
+            dev_batches = list(tqdm(dev_batch_iter(settings), 
+                                    desc='Loading and transforming dev batches...')) \
+                if settings.validate_path else None
+        else:
+            train_batches = None
+            dev_batches = None
         for epoch in range(settings.epochs):
-            train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment)
+            model.train()
+            train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment,
+                        class_counts, train_batches)
             if settings.get('validate_path'):
-                score_model(settings, model, criterion, epoch, comet_experiment)
+                model.eval()
+                score_model(settings, model, criterion, epoch, comet_experiment, dev_batches)
             torch.save(model.state_dict(), settings.model_path + '.bin')
             settings.save(settings.model_path + '.toml')
             logging.info('Model saved at {}'.format(settings.model_path))
@@ -526,18 +574,24 @@ def train(args):
         pass
 
 
-def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment):
+def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, class_counts,
+                train_batches):
     """ Trains a single epoch """
     comet_experiment.log_current_epoch(epoch)
     loss_queue = deque(maxlen=100)
     all_losses = []
-    progress = tqdm(desc='Epoch {}'.format(epoch)) if settings.verbose == 1 else MagicMock()
     correct = 0
     seen = 0
     epoch_period = 1
     started = datetime.now()
 
-    for step, (batch_x, batch_y) in enumerate(train_batch_iter(settings)):
+    progress = tqdm(desc='Epoch {}'.format(epoch), total=sum(class_counts.values())) \
+        if settings.verbose == 1 else MagicMock()
+
+    for step, (batch_x, batch_y) in enumerate(train_batches or train_batch_iter(settings)):
+        if settings.cuda:
+            batch_x = batch_x.cuda()
+            batch_y = batch_y.cuda()
         output, loss = train_batch(model, criterion, optimizer, batch_x, batch_y)
         loss_queue.append(loss)
         all_losses.append(loss)
@@ -557,8 +611,10 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment):
 
     progress.clear()
     if settings.verbose > 0:
-        logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'.format(
-            epoch, correct/seen, sum(all_losses) / len(all_losses), seen / epoch_period))
+        logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'
+                     '\tTotal seconds: {}'.format(
+            epoch, correct/seen, sum(all_losses) / len(all_losses), seen / epoch_period,
+            epoch_period))
 
 
 def train_batch(model, criterion, optimizer, x, y):
@@ -568,17 +624,22 @@ def train_batch(model, criterion, optimizer, x, y):
 
     loss = criterion(output, y)
     loss.backward()
+    if model.gradient_clip:
+        nn.utils.clip_grad_norm(model.parameters(), model.gradient_clip)
     optimizer.step()
 
     return output, loss.data[0]
 
 
-def score_model(args, model, criterion, epoch, comet_experiment):
+def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches):
     """ Score model and update comet """
     losses = []
     correct = 0
     seen = 0
-    for batch_x, batch_y in dev_batch_iter(args):
+    started = datetime.now()
+    for batch_x, batch_y in (dev_batches or dev_batch_iter(settings)):
+        if settings.cuda:
+            batch_x, batch_y = batch_x.cuda(), batch_y.cuda()
         model.zero_grad()
         output = model(batch_x)
         loss = criterion(output, batch_y)
@@ -586,20 +647,25 @@ def score_model(args, model, criterion, epoch, comet_experiment):
         seen += batch_x.size(1)
         correct += float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
 
+    period = (datetime.now() - started).totalseconds()
     comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
     comet_experiment.log_metric('dev_acc', correct / seen)
-    if args.verbose > 0:
-        logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}'.format(
-            epoch, correct/seen, sum(losses) / len(losses)))
+    if settings.verbose > 0:
+        logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}, Scored/sec: {}'.format(
+            epoch, correct/seen, sum(losses) / len(losses)), seen / period)
 
 
 def predict_batch(model, batch):
+    if model.cuda:
+        batch = batch.cuda()
     model.zero_grad()
     output = model(batch)
     return output.cpu() if model.cuda else output
 
 
 def stdout_predict(args):
+    args.context_dropout = 0
+    args.embed_dropout = 0
     settings, model = load_settings_and_model(args.model_path, args)
 
     for batch_x in predict_batch_iter(settings):
