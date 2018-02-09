@@ -206,7 +206,7 @@ class Settings:
 
     # Default values for if no setting is provided for given parameter
     model_param_defaults = {
-        'rnn': 'gru', 'rnn_layers': 1, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
+        'rnn': 'gru', 'rnn_layers': 2, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
         'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
     }
 
@@ -652,7 +652,7 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
     comet_experiment.log_metric('dev_acc', correct / seen)
     if settings.verbose > 0:
         logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}, Scored/sec: {}'.format(
-            epoch, correct/seen, sum(losses) / len(losses)), seen / period)
+            epoch, correct/seen, sum(losses) / len(losses), seen / period))
 
 
 def predict_batch(model, batch):
@@ -683,9 +683,12 @@ def predict(settings, model, texts):
     :param list texts: Texts to predict for
     :rtype: iter
     """
+    started = datetime.now()
     for batch in toolz.partition_all(settings.batch_size, texts):
         output = predict_batch(model, transform_texts(settings, batch)).data
         yield from map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())
+    logging.info('Made {} predictions in {} seconds.'.format(
+        len(texts), (datetime.now() - started).total_seconds()))
 
 
 def main():
@@ -702,7 +705,7 @@ def main():
         stdout_predict(args)
     elif args.mode == 'predict2':
         settings, model = load_settings_and_model('model')
-        print(list(predict(settings, model, ['This is great!', 'Sometimes things just don\'t work out.'])))
+        print(list(predict(settings, model, ['This is great!', 'Sometimes things just don\'t work out.', 'Nothing to complain about!'])))
 
 
 if __name__ == '__main__':
