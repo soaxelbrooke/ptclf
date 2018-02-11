@@ -439,7 +439,6 @@ def transform_texts(settings, texts):
             for col_idx, token in enumerate(toolz.take(settings.msg_len, tokenizer.tokenize(text))):
                 tensor[col_idx, row_idx] = word_to_idx(settings.vocab_size, token)
     return Variable(tensor)
-    return Variable(tensor.cuda()) if settings.cuda else Variable(tensor)
 
 
 def transform_classes(settings, classes):
@@ -447,7 +446,6 @@ def transform_classes(settings, classes):
     class_dict = {cls: idx for idx, cls in enumerate(settings.classes)}
     torch_classes = torch.LongTensor([class_dict[cls] for cls in classes])
     return Variable(torch_classes)
-    return Variable(torch_classes.cuda()) if settings.cuda else Variable(torch_classes)
 
 
 def train_batch_iter(settings):
@@ -551,11 +549,17 @@ def train(args):
 
     try:
         if settings.preload_data:
-            train_batches = list(tqdm(train_batch_iter(settings), 
-                                      desc='Loading and transforming train batches...', 
-                                      total=int(sum(class_counts.values())/settings.batch_size)))
-            dev_batches = list(tqdm(dev_batch_iter(settings), 
-                                    desc='Loading and transforming dev batches...')) \
+            def progress(settings, iterator, desc=None, total=None):
+                if settings.verbose != 1:
+                    return iterator
+                return tqdm(iterator, desc=desc, total=total)
+
+            train_batches = list(progress(
+                settings, train_batch_iter(settings), desc='Loading train batches...',
+                total=int(sum(class_counts.values())/settings.batch_size)))
+
+            dev_batches = list(progress(settings, dev_batch_iter(settings),
+                                        desc='Loading and transforming dev batches...')) \
                 if settings.validate_path else None
         else:
             train_batches = None
