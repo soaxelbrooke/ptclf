@@ -5,6 +5,7 @@ from datetime import datetime
 from uuid import uuid4
 
 import numpy
+from subprocess import check_output
 
 COMET_API_KEY = os.environ.get('COMET_API_KEY')
 COMET_PROJECT = os.environ.get('COMET_PROJECT')
@@ -198,7 +199,7 @@ class Settings:
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
                      'gradient_clip'}
     transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path',
-                       'model_path', 'preload_data'}
+                       'model_path', 'preload_data', 'epoch_shell_callback'}
     comet_hparam_names = {'rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
                           'msg_len', 'context_dim', 'embed_dim', 'batch_size', 'epochs', 'cuda',
                           'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout',
@@ -216,7 +217,8 @@ class Settings:
         'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None,
     }
 
-    transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False}
+    transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False,
+                          'epoch_shell_callback': None}
 
     def __init__(self, model_settings, defaults, transients):
         self.model_settings = model_settings
@@ -411,6 +413,9 @@ def parse_args():
     parser.add_argument('--preload_data', action='store_true',
                         help='Eagerly loads training and dev data. If CUDA selected, loads '
                              'into GPU memory.')
+    parser.add_argument('--epoch_shell_callback', type=str,
+                        help='Shell command executed after each epoch (after model save).',
+                        default=env('EPOCH_SHELL_CALLBACK', str))
 
     return parser.parse_args()
 
@@ -559,7 +564,7 @@ def train(args):
                 total=int(sum(class_counts.values())/settings.batch_size)))
 
             dev_batches = list(progress(settings, dev_batch_iter(settings),
-                                        desc='Loading and transforming dev batches...')) \
+                                        desc='Loading dev batches...')) \
                 if settings.validate_path else None
         else:
             train_batches = None
@@ -574,6 +579,9 @@ def train(args):
             torch.save(model.state_dict(), settings.model_path + '.bin')
             settings.save(settings.model_path + '.toml')
             logging.info('Model saved at {}'.format(settings.model_path))
+            if settings.epoch_shell_callback:
+                logging.info('Executing epoch callback: {}'.format(settings.epoch_shell_callback))
+                check_output(settings.epoch_shell_callback, shell=True)
     except KeyboardInterrupt:
         pass
 
