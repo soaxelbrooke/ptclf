@@ -52,8 +52,9 @@ class WordRnn(nn.Module):
         self.cuda = settings.cuda
         self.gradient_clip = settings.gradient_clip
         self.seqlen = settings.msg_len
-        self.num_classes = len(settings.classes)
+        self.num_classes = len(get_classes(settings))
         self.bidirectional = settings.bidirectional
+        self.loss_fn = settings.loss_fn
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
         if settings.glove_path:
@@ -133,7 +134,10 @@ class WordRnn(nn.Module):
         # hidden shape: (rnn_depth, batch_size, context_size)
         dense = self.dense(last_context)
         # dense shape: (batch_size, num_classes)
-        class_probs = F.softmax(dense, dim=1)
+        if self.loss_fn == 'NLL' or self.loss_fn == 'CrossEntropy':
+            class_probs = F.softmax(dense, dim=1)
+        else:
+            class_probs = F.sigmoid(dense)
         # class probs shape: (batch_size, num_classes)
         return class_probs
 
@@ -155,7 +159,7 @@ def load_glove(path, vocab_size, embed_dim):
     logging.info('Loading GLOVE embeddings from {}'.format(path))
     remaining = set(range(1, vocab_size))
     weights = numpy.zeros((vocab_size, embed_dim), dtype=float)
-    with open(path) as infile:
+    with open(path, encoding='utf-8') as infile:
         for line in infile:
             splits = line.split(' ')
             idx = word_to_idx(vocab_size, splits[0])
@@ -189,6 +193,18 @@ def env(name, transform):
 
 def env_flag(name):
     return env(name, lambda s: s.lower() == 'true')
+
+
+@toolz.memoize
+def get_classes(settings):
+    """ Infer classes from the provided settings
+    :param Settings settings: The settings for which to infer the model classes
+    :rtype: list
+    """
+    if settings.classes is None:
+        df = pandas.read_csv(settings.input_path, nrows=1)
+        settings.model_settings['classes'] = list(df.columns[1:].values)
+    return settings.classes
 
 
 class Settings:
@@ -260,7 +276,7 @@ class Settings:
         :param str path: path to settings TOML file
         :rtype: Settings
         """
-        with open(path) as infile:
+        with open(path, encoding='utf-8') as infile:
             settings_dict = toml.load(infile)
         settings = Settings(settings_dict['model'], settings_dict.get('defaults', {}), {})
         settings.transients['model_path'] = path[:-5]
@@ -271,7 +287,7 @@ class Settings:
         :param str path: Path to save settings to.
         :rtype: NoneType
         """
-        with open(path, 'w') as outfile:
+        with open(path, 'w', encoding='utf-8') as outfile:
             toml.dump({'model': self.model_settings, 'defaults': self.defaults}, outfile)
 
     def to_toml(self):
@@ -446,13 +462,6 @@ def transform_texts(settings, texts):
     return Variable(tensor)
 
 
-def transform_classes(settings, classes):
-    """ Transforms classes based on provided args """
-    class_dict = {cls: idx for idx, cls in enumerate(settings.classes)}
-    torch_classes = torch.LongTensor([class_dict[cls] for cls in classes])
-    return Variable(torch_classes)
-
-
 def train_batch_iter(settings):
     yield from batch_iter_from_path(settings, settings.input_path)
 
@@ -463,14 +472,20 @@ def dev_batch_iter(settings):
 
 def batch_iter_from_path(settings, path):
     """ Loads, transforms, and yields batches for training/testing/prediction """
-    chunk_iter = iter(pandas.read_csv(path, chunksize=settings.batch_size, header=None,
+    chunk_iter = iter(pandas.read_csv(path, chunksize=settings.batch_size,
                                       nrows=settings.get('limit')))
     while True:
         try:
             chunk = next(chunk_iter)
             real_chunk = chunk.dropna(axis=0)
-            yield transform_texts(settings, real_chunk.loc[:, 0].values), \
-                  transform_classes(settings, real_chunk.loc[:, 1].values)
+            # real_chunk = real_chunk[real_chunk[real_chunk.columns[1:]].sum(axis=1) > 0]
+            classes = real_chunk[real_chunk.columns[1:]]
+            if settings.loss_fn == 'CrossEntropy' or settings.loss_fn == 'NLL':
+                classes = torch.LongTensor(classes.values.argmax(axis=1))
+            else:
+                classes = torch.FloatTensor(classes.values)
+            yield transform_texts(settings, real_chunk.text.values), \
+                  Variable(classes)
         except pandas.errors.ParserError:
             pass
 
@@ -487,6 +502,16 @@ def predict_batch_iter(settings):
             pass
 
 
+def num_correct(loss_fn, output, batch_y, decision_boundary=0.5):
+    """ Calculate number of correct predictions """
+    if loss_fn == 'NLL' or loss_fn == 'CrossEntropy':
+        return float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
+    else:
+        output_numpy = (output.data.cpu().numpy() > decision_boundary).astype(int)
+        y_numpy = batch_y.data.cpu().numpy()
+        return float((output_numpy == y_numpy).sum())
+
+
 def build_model(settings):
     """ Builds model based on arguments provided """
     if settings.char_rnn:
@@ -497,10 +522,8 @@ def build_model(settings):
 
 def count_classes(settings):
     """ Infers class weights from provided training data """
-    with open(settings.input_path) as infile:
-        rows = toolz.take(settings.get('limit', 1000000000), csv.reader(infile))
-        counts = Counter(row[1] for row in rows)
-    return counts
+    df = pandas.read_csv(settings.input_path)
+    return df[df.columns[1:]].sum(axis=0).to_dict()
 
 
 def train(args):
@@ -519,7 +542,7 @@ def train(args):
         class_weights = torch.FloatTensor(settings.class_weights)
     else:
         class_weights = torch.FloatTensor([sum(class_counts.values()) / class_counts[c]
-                                           for c in settings.classes])
+                                           for c in get_classes(settings)])
         assert sum(class_counts.values()) > 0, \
             "Didn't find any examples of any classes (input iterator was empty)"
         logging.info('Inferred class weights: {}'.format(class_weights))
@@ -539,6 +562,10 @@ def train(args):
         criterion = nn.CrossEntropyLoss(weight=class_weights)
     elif settings.loss_fn == 'NLL':
         criterion = nn.NLLLoss(weight=class_weights)
+    elif settings.loss_fn == 'MultiLabelMargin':
+        criterion = nn.MultiLabelMarginLoss()
+    elif settings.loss_fn == 'BCE':
+        criterion = nn.BCELoss()
     else:
         raise RuntimeError('Invalid loss value provided: {}'.format(settings.loss_fn))
 
@@ -548,7 +575,7 @@ def train(args):
         comet_experiment = Experiment(api_key=COMET_API_KEY, project_name=COMET_PROJECT,
                                       log_code=COMET_LOG_CODE)
         comet_experiment.log_multiple_params(settings.to_comet_hparams())
-        comet_experiment.log_dataset_hash(open(settings.input_path).read())
+        comet_experiment.log_dataset_hash(open(settings.input_path, encoding='utf-8').read())
     else:
         comet_experiment = MagicMock()
 
@@ -609,8 +636,10 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
         all_losses.append(loss)
         rolling_loss = sum(loss_queue) / len(loss_queue)
         seen += batch_x.size(1)
-        correct += float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
+        correct += num_correct(settings.loss_fn, output, batch_y)
         accuracy = correct / seen
+        if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
+            accuracy /= len(settings.classes)
 
         progress.set_postfix(loss=rolling_loss, acc=accuracy)
         progress.update(batch_x.size(1))
@@ -625,7 +654,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
     if settings.verbose > 0:
         logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'
                      '\tTotal seconds: {}'.format(
-            epoch, correct/seen, sum(all_losses) / len(all_losses), seen / epoch_period,
+            epoch, accuracy, sum(all_losses) / len(all_losses), seen / epoch_period,
             epoch_period))
 
 
@@ -657,14 +686,17 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         loss = criterion(output, batch_y)
         losses.append(loss.data[0])
         seen += batch_x.size(1)
-        correct += float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
+        correct += num_correct(settings.loss_fn, output, batch_y)
 
     period = (datetime.now() - started).total_seconds()
+    accuracy = correct / seen
+    if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
+        accuracy /= len(settings.classes)
     comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
-    comet_experiment.log_metric('dev_acc', correct / seen)
+    comet_experiment.log_metric('dev_acc', accuracy)
     if settings.verbose > 0:
         logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}, Scored/sec: {}'.format(
-            epoch, correct/seen, sum(losses) / len(losses), seen / period))
+            epoch, accuracy, sum(losses) / len(losses), seen / period))
 
 
 def predict_batch(model, batch):
@@ -717,7 +749,19 @@ def main():
         stdout_predict(args)
     elif args.mode == 'predict2':
         settings, model = load_settings_and_model('model')
-        print(list(predict(settings, model, ['This is great!', 'Sometimes things just don\'t work out.', 'Nothing to complain about!'])))
+        examples = [
+            'This is great!', 
+            'Sometimes things just don\'t work out.', 
+            'Nothing to complain about!',
+            'It defeinitely lives up to the hype!',
+            'After everything people said, a definite disappointment.  Hopefully they do better next time.',
+            'If that means no more fucking around with nvidia drivers on aws then sign me up.',
+            'New and improved, and now completely unusable since update. Zestimate is under a heading "Home Value" It is fraudulent and misleading and needs to be eliminated.',
+            'Spammy. When you share something instead of a URL it dumps half a page of ad text and app links. Then it signs your email up for reports on that property. Geez, forbid I share a listing with a friend... Going to just find something less spam filled.',
+        ]
+        results = list(predict(settings, model, examples)) 
+        for example, result in zip(examples, results):
+            print(example, '=>', result)
 
 
 if __name__ == '__main__':
