@@ -58,8 +58,7 @@ class WordRnn(nn.Module):
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
         if settings.glove_path:
-            self.embedding.weight.data.copy_(load_glove(settings.glove_path, settings.vocab_size,
-                                                        self.embed_size))
+            self.embedding.weight.data.copy_(load_glove(settings))
 
         self.embed_dropout = nn.Dropout(settings.embed_dropout)
 
@@ -151,19 +150,21 @@ class WordRnn(nn.Module):
             return init1.cuda() if self.cuda else init1, init2.cuda() if self.cuda else init2
 
 
-def load_glove(path, vocab_size, embed_dim):
+def load_glove(settings):
     """ Load glove embeddings specified
     :param str path: path to load glove embeddings from
     :rtype: torch.FloatTensor
     """
-    logging.info('Loading GLOVE embeddings from {}'.format(path))
-    remaining = set(range(1, vocab_size))
-    weights = numpy.zeros((vocab_size, embed_dim), dtype=float)
-    with open(path, encoding='utf-8') as infile:
+    logging.info('Loading GLOVE embeddings from {}'.format(settings.glove_path))
+    remaining = set(range(1, settings.vocab_size))
+    weights = numpy.zeros((settings.vocab_size, settings.embed_dim), dtype=float)
+    bar = progress(settings, desc='Loading GLOVE weights...', total=settings.vocab_size)
+    with open(settings.glove_path, encoding='utf-8') as infile:
         for line in infile:
             splits = line.split(' ')
-            idx = word_to_idx(vocab_size, splits[0])
+            idx = word_to_idx(settings.vocab_size, splits[0])
             if idx in remaining:
+                bar.update(1)
                 weights[idx, :] = numpy.array(splits[1:], dtype=float)
                 remaining.remove(idx)
             if len(remaining) == 0:
@@ -183,6 +184,18 @@ def load_settings_and_model(path, args=None):
     model = WordRnn.load(settings)
     model.eval()
     return settings, model
+
+
+def progress(settings, iterator=None, desc=None, total=None):
+    if settings.verbose != 1:
+        if iterator is None:
+            return MagicMock()
+        else:
+            return iterator
+    if iterator is None:
+        return tqdm(desc=desc, total=total)
+    else:
+        return tqdm(iterator, desc=desc, total=total)
 
 
 def env(name, transform):
@@ -581,10 +594,6 @@ def train(args):
 
     try:
         if settings.preload_data:
-            def progress(settings, iterator, desc=None, total=None):
-                if settings.verbose != 1:
-                    return iterator
-                return tqdm(iterator, desc=desc, total=total)
 
             train_batches = list(progress(
                 settings, train_batch_iter(settings), desc='Loading train batches...',
@@ -716,7 +725,8 @@ def stdout_predict(args):
         output = predict_batch(model, batch_x).data
         if settings.cuda:
             output = output.cpu()
-        print('\n'.join(map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())))
+        for row in output.numpy().tolist():
+            print(','.join(map(str, row)))
 
 
 def predict(settings, model, texts):
