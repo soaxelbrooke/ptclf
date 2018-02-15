@@ -1,11 +1,10 @@
 #!/usr/bin/env python3.6
-import csv
 import os
 from datetime import datetime
+from subprocess import check_output
 from uuid import uuid4
 
 import numpy
-from subprocess import check_output
 
 COMET_API_KEY = os.environ.get('COMET_API_KEY')
 COMET_PROJECT = os.environ.get('COMET_PROJECT')
@@ -30,7 +29,8 @@ cudnn.benchmark = True
 
 import toml
 
-from collections import deque, Counter
+from sklearn import metrics
+from collections import deque
 from nltk.tokenize import RegexpTokenizer
 from tqdm import tqdm
 tqdm.monitor_interval = 0  # https://github.com/tqdm/tqdm/issues/481
@@ -247,7 +247,7 @@ class Settings:
     }
 
     transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False,
-                          'epoch_shell_callback': None}
+                          'epoch_shell_callback': None, 'validate_path': None}
 
     def __init__(self, model_settings, defaults, transients):
         self.model_settings = model_settings
@@ -526,6 +526,24 @@ def num_correct(loss_fn, output, batch_y, decision_boundary=0.5):
         return float((output_numpy == y_numpy).sum())
 
 
+def auroc(output, batch_y):
+    """ Calculates the Area Under the Receiver Operator Characteristic curve """
+    if output.is_cuda:
+        output = output.cpu()
+        batch_y = batch_y.cpu()
+    aucrocs = []
+    for class_idx in range(output.shape[1]):
+        y = batch_y[:, class_idx].data.numpy()
+        p = output[:, class_idx].data.numpy()
+        if len(numpy.unique(y)) == 1:
+            continue
+        aucrocs.append(metrics.roc_auc_score(y, p))
+    if len(aucrocs):
+        return numpy.mean(aucrocs)
+    else:
+        return 0
+
+
 def build_model(settings):
     """ Builds model based on arguments provided """
     if settings.char_rnn:
@@ -557,6 +575,7 @@ def train(args):
     else:
         class_weights = torch.FloatTensor([sum(class_counts.values()) / class_counts[c]
                                            for c in get_classes(settings)])
+        class_weights /= class_weights.min()
         assert sum(class_counts.values()) > 0, \
             "Didn't find any examples of any classes (input iterator was empty)"
         logging.info('Inferred class weights: {}'.format(class_weights))
@@ -632,6 +651,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
     comet_experiment.log_current_epoch(epoch)
     loss_queue = deque(maxlen=100)
     all_losses = []
+    accuracies = []
     correct = 0
     seen = 0
     epoch_period = 1
@@ -649,10 +669,11 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
         all_losses.append(loss)
         rolling_loss = sum(loss_queue) / len(loss_queue)
         seen += batch_x.size(1)
-        correct += num_correct(settings.loss_fn, output, batch_y)
-        accuracy = correct / seen
         if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
-            accuracy /= len(settings.classes)
+            accuracies.append(auroc(output, batch_y))
+        else:
+            accuracies.append(num_correct(settings.loss_fn, output, batch_y) / batch_x.shape[0])
+        accuracy = numpy.mean(accuracies)
 
         progress.set_postfix(loss=rolling_loss, acc=accuracy)
         progress.update(batch_x.size(1))
@@ -667,7 +688,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
     if settings.verbose > 0:
         logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'
                      '\tTotal seconds: {}'.format(
-            epoch, accuracy, sum(all_losses) / len(all_losses), seen / epoch_period,
+            epoch, numpy.mean(accuracies), sum(all_losses) / len(all_losses), seen / epoch_period,
             epoch_period))
 
 
@@ -688,7 +709,7 @@ def train_batch(model, criterion, optimizer, x, y):
 def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches):
     """ Score model and update comet """
     losses = []
-    correct = 0
+    accuracies = []
     seen = 0
     started = datetime.now()
     for batch_x, batch_y in (dev_batches or dev_batch_iter(settings)):
@@ -699,12 +720,13 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         loss = criterion(output, batch_y)
         losses.append(loss.data[0])
         seen += batch_x.size(1)
-        correct += num_correct(settings.loss_fn, output, batch_y)
+        if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
+            accuracies.append(auroc(output, batch_y))
+        else:
+            accuracies.append(num_correct(settings.loss_fn, output, batch_y) / batch_x.shape[0])
 
     period = (datetime.now() - started).total_seconds()
-    accuracy = correct / seen
-    if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
-        accuracy /= len(settings.classes)
+    accuracy = numpy.mean(accuracies)
     comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
     comet_experiment.log_metric('dev_acc', accuracy)
     if settings.verbose > 0:
