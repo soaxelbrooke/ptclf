@@ -516,14 +516,9 @@ def predict_batch_iter(settings):
             pass
 
 
-def num_correct(loss_fn, output, batch_y, decision_boundary=0.5):
+def num_correct(output, batch_y):
     """ Calculate number of correct predictions """
-    if loss_fn == 'NLL' or loss_fn == 'CrossEntropy':
-        return float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
-    else:
-        output_numpy = (output.data.cpu().numpy() > decision_boundary).astype(int)
-        y_numpy = batch_y.data.cpu().numpy()
-        return float((output_numpy == y_numpy).sum())
+    return float(sum((output.max(1)[1] == batch_y).data.cpu().numpy()))
 
 
 def auroc(output, batch_y):
@@ -652,7 +647,6 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
     loss_queue = deque(maxlen=100)
     all_losses = []
     accuracies = []
-    correct = 0
     seen = 0
     epoch_period = 1
     started = datetime.now()
@@ -672,7 +666,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
         if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
             accuracies.append(auroc(output, batch_y))
         else:
-            accuracies.append(num_correct(settings.loss_fn, output, batch_y) / batch_x.shape[0])
+            accuracies.append(num_correct(output, batch_y) / batch_x.shape[1])
         accuracy = numpy.mean(accuracies)
 
         progress.set_postfix(loss=rolling_loss, acc=accuracy)
@@ -723,7 +717,7 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
             accuracies.append(auroc(output, batch_y))
         else:
-            accuracies.append(num_correct(settings.loss_fn, output, batch_y) / batch_x.shape[0])
+            accuracies.append(num_correct(output, batch_y) / batch_x.shape[1])
 
     period = (datetime.now() - started).total_seconds()
     accuracy = numpy.mean(accuracies)
