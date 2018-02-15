@@ -445,6 +445,7 @@ def parse_args():
     parser.add_argument('--epoch_shell_callback', type=str,
                         help='Shell command executed after each epoch (after model save).',
                         default=env('EPOCH_SHELL_CALLBACK', str))
+    parser.add_argument('--predict_top', action='store_true')
 
     return parser.parse_args()
 
@@ -571,6 +572,8 @@ def train(args):
     else:
         raise RuntimeError('Invalid optim value provided: {}'.format(settings.optimizer))
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
+
     if settings.loss_fn == 'CrossEntropy':
         criterion = nn.CrossEntropyLoss(weight=class_weights)
     elif settings.loss_fn == 'NLL':
@@ -611,7 +614,8 @@ def train(args):
                         class_counts, train_batches)
             if settings.get('validate_path'):
                 model.eval()
-                score_model(settings, model, criterion, epoch, comet_experiment, dev_batches)
+                val_loss = score_model(settings, model, criterion, epoch, comet_experiment, dev_batches)
+                scheduler.step(val_loss, epoch=epoch)
             torch.save(model.state_dict(), settings.model_path + '.bin')
             settings.save(settings.model_path + '.toml')
             logging.info('Model saved at {}'.format(settings.model_path))
@@ -706,6 +710,7 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
     if settings.verbose > 0:
         logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}, Scored/sec: {}'.format(
             epoch, accuracy, sum(losses) / len(losses), seen / period))
+    return sum(losses) / len(losses)
 
 
 def predict_batch(model, batch):
@@ -725,8 +730,11 @@ def stdout_predict(args):
         output = predict_batch(model, batch_x).data
         if settings.cuda:
             output = output.cpu()
-        for row in output.numpy().tolist():
-            print(','.join(map(str, row)))
+        if args.predict_top:
+            print('\n'.join(settings.classes[c] for c in output.max(1)[1]))
+        else:
+            for row in output.numpy().tolist():
+                print(','.join(map(str, row)))
 
 
 def predict(settings, model, texts):
