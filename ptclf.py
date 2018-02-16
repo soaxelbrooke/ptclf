@@ -410,7 +410,8 @@ def parse_args():
     parser.add_argument('--rnn', type=str,
                         help='Type of RNN used - one of {gru, lstm}')
     parser.add_argument('--rnn_layers', type=int, default=env('RNN_LAYERS', int),
-                        help='Number of RNN layers to stack')
+                        help='Number of RNN layers.  Best at 1 or 2 for word-level models, deeper '
+                             'is more valuable for character-level models.')
     parser.add_argument('--bidirectional', action='store_true', default=env_flag('BIDIRECTIONAL'),
                         help='If set, RNN is bidirectional')
     parser.add_argument('--learn_rnn_init', action='store_true', default=env_flag('LEARN_RNN_INIT'),
@@ -425,7 +426,9 @@ def parse_args():
     parser.add_argument('-c', '--context_dim', type=int, default=env('CONTEXT_DIM', int),
                         help='Dimension of the RNN context vector')
     parser.add_argument('-e', '--embed_dim', type=int, default=env('EMBED_DIM', int),
-                        help='Dimension of the embedding (only used for word-RNN)')
+                        help='Dimension of the embedding (only used for word-RNN). Larger is better'
+                             ' for more abstract tasks like sentiment classification, and smaller '
+                             'is better for more syntactic tasks like POS-tagging.')
     parser.add_argument('--token_regex', type=str,
                         default=env('TOKEN_REGEX', str),
                         help='Regexp pattern to tokenize with')
