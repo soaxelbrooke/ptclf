@@ -21,9 +21,10 @@ python3.6 get-pip.py
 ln -s `which pip` /bin/pip
 
 echo "Setting up ptclf.py..."
-gsutil cp gs://axelbrooke-data/ptclf/requirements.txt ./
-gsutil cp gs://axelbrooke-data/ptclf/ptclf.py ./
+gcloud source repos clone ptclf --project=axelbrooke-com
+cd ptclf
 python3.6 -m pip install -r requirements.txt
+ln -s /ptclf.py ptclf/ptclf.py
 exit 0
 
 export EMBED_DIM=200
