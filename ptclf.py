@@ -55,6 +55,14 @@ class WordRnn(nn.Module):
         self.num_classes = len(get_classes(settings))
         self.bidirectional = settings.bidirectional
         self.loss_fn = settings.loss_fn
+        self.context_mode = settings.context_mode
+
+        self.bidir_factor = 1 + int(self.bidirectional)
+        if self.context_mode == 'attention':
+            assert self.context_size * self.bidir_factor == self.embed_size, \
+                'RNN output size must equal embed size for attention context_mode, got RNN output' \
+                'size of {} and embed size of {}'.format(self.context_size * self.bidir_factor,
+                                                         self.embed_size)
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
         if settings.glove_path:
@@ -63,7 +71,6 @@ class WordRnn(nn.Module):
 
         self.embed_dropout = nn.Dropout(settings.embed_dropout)
 
-        self.bidir_factor = 1 + int(self.bidirectional)
         rnn_hidden_shape = (settings.rnn_layers * self.bidir_factor, 1, self.context_size)
 
         if self.rnn_kind == 'gru':
@@ -101,6 +108,12 @@ class WordRnn(nn.Module):
 
         self.init_weights()
 
+    def attend_to(self, context: torch.FloatTensor, embedded: torch.FloatTensor, smooth=True):
+        similarities = torch.bmm(
+            embedded.permute(1, 0, 2), context[-1:].permute(1, 2, 0)).sigmoid()
+        alpha = similarities / torch.sum(similarities, 1, keepdim=True).expand_as(similarities)
+        return torch.sum(alpha.permute(1, 0, 2) * embedded, 0)
+
     @classmethod
     def load(cls, settings):
         """ Load model from provided path
@@ -128,12 +141,16 @@ class WordRnn(nn.Module):
         hidden_state = self.init_hidden(batch_size)
         embedded = self.embed_dropout(self.embedding(input_tensor))
         # embedded shape: (msg_len, batch_size, embed_size)
-        context, hidden = self.rnn(embedded, hidden_state)
-        last_context = torch.max(self.rnn_dropout(context), 0)[0]
-        # last_context = self.rnn_dropout(context)[-1]
+        rnn_context, hidden = self.rnn(embedded, hidden_state)
+        if self.context_mode == 'attention':
+            context = self.attend_to(rnn_context, embedded)
+        elif self.context_mode == 'last':
+            context = self.rnn_dropout(rnn_context)[-1]
+        else:
+            context = torch.max(self.rnn_dropout(rnn_context), 0)[0]
         # context shape: (msg_len, batch_size, context_size)
         # hidden shape: (rnn_depth, batch_size, context_size)
-        dense = self.dense(last_context)
+        dense = self.dense(context)
         # dense shape: (batch_size, num_classes)
         if self.loss_fn == 'NLL' or self.loss_fn == 'CrossEntropy':
             class_probs = F.softmax(dense, dim=1)
@@ -226,7 +243,7 @@ def get_classes(settings):
 class Settings:
     model_param_names = {'id', 'created_at', 'rnn', 'rnn_layers', 'char_rnn', 'bidirectional',
                          'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim',
-                         'learn_rnn_init'}
+                         'learn_rnn_init', 'context_mode'}
     default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss_fn',
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
                      'gradient_clip'}
@@ -241,6 +258,7 @@ class Settings:
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 2, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
         'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
+        'context_mode': 'max',
     }
 
     default_defaults = {
@@ -419,6 +437,8 @@ def parse_args():
                         help='If set, RNN is bidirectional')
     parser.add_argument('--learn_rnn_init', action='store_true', default=env_flag('LEARN_RNN_INIT'),
                         help='Learn RNN initial state (default inits to tensor of 0s)')
+    parser.add_argument('--context_mode', type=str, default=env('CONTEXT_MODE', str),
+                        help='How RNN context is turned into ')
 
     parser.add_argument('--char_rnn', action='store_true',
                         help='Use a character RNN instead of word RNN')
