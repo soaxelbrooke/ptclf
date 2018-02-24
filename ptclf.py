@@ -609,7 +609,7 @@ def train(args):
         assert COMET_PROJECT is not None, 'You must specify a comet project to use if providing' \
                                           ' COMET_API_KEY environment variable.'
         comet_experiment = Experiment(api_key=COMET_API_KEY, project_name=COMET_PROJECT,
-                                      log_code=COMET_LOG_CODE)
+                                      log_code=COMET_LOG_CODE, parse_args=False)
         comet_experiment.log_multiple_params(settings.to_comet_hparams())
     else:
         comet_experiment = MagicMock()
