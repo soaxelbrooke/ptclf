@@ -15,6 +15,6 @@ gcloud compute instances create $INST_NAME \
     --accelerator type=$GPU_TYPE,count=1 \
     --image-family ubuntu-1604-lts --image-project ubuntu-os-cloud \
     --maintenance-policy TERMINATE \
-    --scopes storage-rw \
+    --scopes storage-rw,https://www.googleapis.com/auth/source.read_only \
     --metadata-from-file startup-script='gce-startup.sh'
 
