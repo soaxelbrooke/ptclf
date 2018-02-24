@@ -2,7 +2,7 @@
 
 export DISK_SIZE=30GB
 export GPU_TYPE=nvidia-tesla-k80
-export MACHINE_TYPE=n1-standard-2
+export MACHINE_TYPE=n1-highmem-4
 export ZONE=us-west1-b
 export INST_NAME=ptclf-$(uuidgen | cut -c 1-4)
 echo "Creating preemptible GCE GPU $MACHINE_TYPE instance with 1 $GPU_TYPE named '$INST_NAME' in $ZONE..."
