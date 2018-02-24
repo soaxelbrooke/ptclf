@@ -24,14 +24,14 @@ echo "Setting up ptclf.py..."
 gsutil cp gs://axelbrooke-data/ptclf/requirements.txt ./
 gsutil cp gs://axelbrooke-data/ptclf/ptclf.py ./
 python3.6 -m pip install -r requirements.txt
-
+exit 0
 
 export EMBED_DIM=200
 export PYTHONIOENCODING=utf8
 
 echo "Downloading data..."
-gsutil cp gs://axelbrooke-data/sentiment-tmp/train.csv ./train.csv
-gsutil cp gs://axelbrooke-data/sentiment-tmp/dev.csv ./dev.csv
+gsutil cp gs://axelbrooke-data/sentiment-2018-02/combined.tar.gz ./
+tar -xzvf combined.tar.gz
 gsutil cp gs://axelbrooke-data/glove/glove.twitter.27B.$(echo "$EMBED_DIM")d.txt ./glove.txt
 
 export COMET_API_KEY=DQqhNiimkjP0gK6c8iGz9orzL
