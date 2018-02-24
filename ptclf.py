@@ -59,6 +59,7 @@ class WordRnn(nn.Module):
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
         if settings.glove_path:
             self.embedding.weight.data.copy_(load_glove(settings))
+            logging.info('Done copying GLOVE weights.')
 
         self.embed_dropout = nn.Dropout(settings.embed_dropout)
 
@@ -128,7 +129,8 @@ class WordRnn(nn.Module):
         embedded = self.embed_dropout(self.embedding(input_tensor))
         # embedded shape: (msg_len, batch_size, embed_size)
         context, hidden = self.rnn(embedded, hidden_state)
-        last_context = self.rnn_dropout(context)[-1]
+        last_context = torch.max(self.rnn_dropout(context), 0)[0]
+        # last_context = self.rnn_dropout(context)[-1]
         # context shape: (msg_len, batch_size, context_size)
         # hidden shape: (rnn_depth, batch_size, context_size)
         dense = self.dense(last_context)
@@ -169,6 +171,7 @@ def load_glove(settings):
                 remaining.remove(idx)
             if len(remaining) == 0:
                 break
+    logging.info('Done loading GLOVE weights.')
     return torch.from_numpy(weights)
 
 
@@ -242,7 +245,7 @@ class Settings:
 
     default_defaults = {
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
-        'loss_fn': 'CrossEntropy', 'embed_dropout': 0.1, 'context_dropout': 0.1,
+        'loss_fn': 'CrossEntropy', 'embed_dropout': 0.3, 'context_dropout': 0.3,
         'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None,
     }
 
@@ -608,7 +611,6 @@ def train(args):
         comet_experiment = Experiment(api_key=COMET_API_KEY, project_name=COMET_PROJECT,
                                       log_code=COMET_LOG_CODE)
         comet_experiment.log_multiple_params(settings.to_comet_hparams())
-        comet_experiment.log_dataset_hash(open(settings.input_path, encoding='utf-8').read())
     else:
         comet_experiment = MagicMock()
 
