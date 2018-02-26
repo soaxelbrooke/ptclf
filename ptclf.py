@@ -19,6 +19,7 @@ import toolz
 import pandas
 import mmh3
 import logging
+import time
 
 import torch
 from torch import nn
@@ -259,10 +260,11 @@ class Settings:
                      'gradient_clip'}
     transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path',
                        'model_path', 'preload_data', 'epoch_shell_callback'}
-    comet_hparam_names = {'rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
+    comet_hparam_names = ['rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
                           'msg_len', 'context_dim', 'embed_dim', 'batch_size', 'epochs', 'cuda',
                           'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout',
-                          'context_dropout', 'token_regex', 'class_weights'}
+                          'context_dropout', 'token_regex', 'class_weights', 'learn_rnn_init',
+                          'context_mode']
 
     # Default values for if no setting is provided for given parameter
     model_param_defaults = {
@@ -593,6 +595,18 @@ def count_classes(settings):
 def train(args):
     """ Trains RNN based on provided arguments """
     settings = Settings.from_args(args)
+    sle = SqliteExperiment(
+        [('rnn', str), ('rnn_layers', int), ('char_rnn', bool), ('bidirectional', bool),
+         ('classes', str), ('vocab_size', int), ('msg_len', int), ('context_dim', int),
+         ('embed_dim', int), ('batch_size', int), ('epochs', int), ('cuda', bool),
+         ('learning_rate', float), ('optimizer', str), ('loss_fn', str), ('embed_dropout', float),
+         ('context_dropout', float), ('token_regex', str), ('learn_rnn_init', bool),
+         ('context_mode', str)],
+        [('loss', float), ('dev_loss', float), ('epoch', int), ('samples_seen', int),
+         ('acc', float), ('dev_acc', float), ('train_per_second', float),
+         ('score_per_second', float)],
+        os.environ.get('EXPERIMENT_ID'))
+    sle.log_hparams(settings.to_comet_hparams())
     model = build_model(settings)
     if args.continued:
         model = WordRnn(settings)
@@ -647,7 +661,6 @@ def train(args):
 
     try:
         if settings.preload_data:
-
             train_batches = list(progress(
                 settings, train_batch_iter(settings), desc='Loading train batches...',
                 total=int(sum(class_counts.values())/settings.batch_size)))
@@ -661,10 +674,11 @@ def train(args):
         for epoch in range(settings.epochs):
             model.train()
             train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment,
-                        class_counts, train_batches)
+                        class_counts, train_batches, sle)
             if settings.get('validate_path'):
                 model.eval()
-                val_loss = score_model(settings, model, criterion, epoch, comet_experiment, dev_batches)
+                val_loss = score_model(settings, model, criterion, epoch, comet_experiment,
+                                       dev_batches, sle)
                 scheduler.step(val_loss, epoch=epoch)
             torch.save(model.state_dict(), settings.model_path + '.bin')
             settings.save(settings.model_path + '.toml')
@@ -677,7 +691,7 @@ def train(args):
 
 
 def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, class_counts,
-                train_batches):
+                train_batches, sle):
     """ Trains a single epoch """
     comet_experiment.log_current_epoch(epoch)
     loss_queue = deque(maxlen=100)
@@ -705,6 +719,8 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
             accuracies.append(num_correct(output, batch_y) / batch_x.shape[1])
         accuracy = numpy.mean(accuracies)
 
+        sle.log_metrics(epoch, seen, {'loss': loss, 'epoch': epoch, 'samples_seen': seen,
+                                      'acc': accuracy, 'train_per_second': seen / epoch_period})
         progress.set_postfix(loss=rolling_loss, acc=accuracy)
         progress.update(batch_x.size(1))
 
@@ -736,7 +752,7 @@ def train_batch(model, criterion, optimizer, x, y):
     return output, loss.data[0]
 
 
-def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches):
+def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches, sle):
     """ Score model and update comet """
     losses = []
     accuracies = []
@@ -755,9 +771,13 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         else:
             accuracies.append(num_correct(output, batch_y) / batch_x.shape[1])
 
-    period = (datetime.now() - started).total_seconds()
     accuracy = numpy.mean(accuracies)
-    comet_experiment.log_metric('dev_loss', sum(losses) / len(losses))
+    period = (datetime.now() - started).total_seconds()
+    mean_loss = sum(losses) / len(losses)
+    sle.log_metrics(epoch, seen, {'dev_loss': mean_loss, 'epoch': epoch,
+                                  'dev_acc': accuracy, 'score_per_second': seen / period},
+                    force=True)
+    comet_experiment.log_metric('dev_loss', mean_loss)
     comet_experiment.log_metric('dev_acc', accuracy)
     if settings.verbose > 0:
         logging.info('Epoch: {}\t  Dev accuracy: {:.3f}\t  Dev loss: {:.3f}, Scored/sec: {}'.format(
@@ -803,6 +823,86 @@ def predict(settings, model, texts):
         yield from map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())
     logging.info('Made {} predictions in {} seconds.'.format(
         len(texts), (datetime.now() - started).total_seconds()))
+
+
+import sqlite3
+
+class SqliteExperiment:
+    def __init__(self, hparams, metrics, log_every=None, experiment_id=None):
+        self.experiment_id = experiment_id or str(uuid4())
+        self.hparams = hparams
+        self.metrics = metrics
+        self.metric_names = ['experiment_id', 'measured_at'] + [n for n, t in metrics]
+        self.log_every = int(os.environ.get('LOG_EVERY', 10000))
+        self.last_log = None
+        self.last_epoch = None
+        self.db = sqlite3.connect('experiments.sqlite')
+        self.ensure_tables()
+
+    def ensure_tables(self):
+        """ Create tables for metrics and hyper params if they don't exist """
+        self.db.execute('''
+CREATE TABLE IF NOT EXISTS hparams (
+  experiment_id text primary key,
+  {}
+)
+        '''.format(self.to_sql_column_defs(self.hparams).strip(',')))
+
+        self.db.execute('''
+CREATE TABLE IF NOT EXISTS metrics (
+  experiment_id text,
+  measured_at int,
+  {}
+)
+        '''.format(self.to_sql_column_defs(self.metrics).strip(',')))
+        self.db.commit()
+
+    @classmethod
+    def to_sqlite_col_type(cls, col_type):
+        return {
+            int: 'integer',
+            float: 'real',
+            str: 'text',
+            bool: 'integer',
+        }[col_type]
+
+    def to_sql_column_defs(self, spec):
+        return ',\n'.join([
+            '{} {}'.format(col_name, self.to_sqlite_col_type(col_type))
+            for col_name, col_type in spec
+        ]) + ','
+
+    def log_hparams(self, hparams):
+        hparam_values = [self.experiment_id] + [hparams[name] for name, _type in self.hparams]
+        for idx, hparam in enumerate(hparam_values):
+            if isinstance(hparam, list):
+                hparam_values[idx] = ','.join(map(str, hparam))
+        self.db.execute('''
+insert into hparams values ({})
+        '''.format(', '.join(['?'] * len(hparam_values))), hparam_values)
+        self.db.commit()
+
+    def should_log(self, epoch, step):
+        should_log = False
+        if (self.last_epoch is None or self.last_log is None) \
+                or (self.last_epoch < epoch) \
+                or ((self.last_log + self.log_every) < step):
+            self.last_epoch = epoch
+            self.last_log = step
+            should_log = True
+        return should_log
+
+    def log_metrics(self, epoch, step, metrics, force=False):
+        if not force and not self.should_log(epoch, step):
+            return
+        metric_values = [self.experiment_id, time.time()] + \
+                        [metrics.get(name) for name, _type in self.metrics]
+        self.db.execute(
+            '''
+insert into metrics ({}) values ({})
+            '''.format(', '.join(self.metric_names), ', '.join(['?'] * len(metric_values))),
+            metric_values)
+        self.db.commit()
 
 
 def main():
