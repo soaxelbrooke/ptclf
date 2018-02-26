@@ -66,10 +66,9 @@ class WordRnn(nn.Module):
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
         if settings.glove_path:
-            self.embedding.weight.data.copy_(load_glove(settings))
-            logging.info('Done copying GLOVE weights.')
+            self.embedding.weight.data.copy_(load_embedding_weights(settings))
 
-        self.embed_dropout = nn.Dropout(settings.embed_dropout)
+        self.embed_dropout = nn.Dropout2d(settings.embed_dropout)
 
         rnn_hidden_shape = (settings.rnn_layers * self.bidir_factor, 1, self.context_size)
 
@@ -81,7 +80,7 @@ class WordRnn(nn.Module):
                 self.rnn_init_h = Variable(torch.zeros(
                     self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
             self.rnn = nn.GRU(self.embed_size, self.context_size, self.rnn_layers,
-                              bidirectional=self.bidirectional, dropout=settings.context_dropout)
+                              bidirectional=self.bidirectional)
         elif self.rnn_kind == 'lstm':
             if settings.learn_rnn_init:
                 self.rnn_init_h1 = nn.Parameter(
@@ -94,18 +93,23 @@ class WordRnn(nn.Module):
                 self.rnn_init_h2 = Variable(torch.zeros(
                     self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
             self.rnn = nn.LSTM(self.embed_size, self.context_size, self.rnn_layers,
-                               bidirectional=self.bidirectional, dropout=settings.context_dropout)
+                               bidirectional=self.bidirectional)
         else:
             raise RuntimeError('Got invalid rnn type: {}'.format(self.rnn_kind))
 
-        self.rnn_dropout = nn.Dropout(settings.context_dropout)
-        self.dense = nn.Linear(self.context_size * self.bidir_factor, self.num_classes)
+        self.rnn_dropout = nn.Dropout2d(settings.context_dropout)
+        if self.context_mode == 'attention' or self.context_mode == 'maxavg':
+            self.dense = nn.Linear(self.context_size * self.bidir_factor * 2, self.num_classes)
+        else:
+            self.dense = nn.Linear(self.context_size * self.bidir_factor, self.num_classes)
 
         if self.cuda:
+            logging.info('CUDA selected, changing components to CUDA...')
             self.embedding.cuda()
             self.rnn.cuda()
             self.dense.cuda()
 
+        logging.info('Initializing weights...')
         self.init_weights()
 
     def attend_to(self, context: torch.FloatTensor, embedded: torch.FloatTensor, smooth=True):
@@ -142,12 +146,15 @@ class WordRnn(nn.Module):
         embedded = self.embed_dropout(self.embedding(input_tensor))
         # embedded shape: (msg_len, batch_size, embed_size)
         rnn_context, hidden = self.rnn(embedded, hidden_state)
+        rnn_context = self.rnn_dropout(rnn_context)
         if self.context_mode == 'attention':
-            context = self.attend_to(rnn_context, embedded)
+            context = torch.cat([self.attend_to(rnn_context, embedded), rnn_context[-1]], 1)
         elif self.context_mode == 'last':
-            context = self.rnn_dropout(rnn_context)[-1]
+            context = rnn_context[-1]
+        elif self.context_mode == 'maxavg':
+            context = torch.cat([torch.max(rnn_context, 0)[0], torch.mean(rnn_context, 0)], 1)
         else:
-            context = torch.max(self.rnn_dropout(rnn_context), 0)[0]
+            context = torch.max(rnn_context, 0)[0]
         # context shape: (msg_len, batch_size, context_size)
         # hidden shape: (rnn_depth, batch_size, context_size)
         dense = self.dense(context)
@@ -169,18 +176,21 @@ class WordRnn(nn.Module):
             return init1.cuda() if self.cuda else init1, init2.cuda() if self.cuda else init2
 
 
-def load_glove(settings):
-    """ Load glove embeddings specified
-    :param str path: path to load glove embeddings from
+def load_embedding_weights(settings):
+    """ Load embeddings weights
+    :param str path: path to load embedding weights from
     :rtype: torch.FloatTensor
     """
-    logging.info('Loading GLOVE embeddings from {}'.format(settings.glove_path))
+    logging.info('Loading embeddings from {}'.format(settings.glove_path))
     remaining = set(range(1, settings.vocab_size))
     weights = numpy.zeros((settings.vocab_size, settings.embed_dim), dtype=float)
-    bar = progress(settings, desc='Loading GLOVE weights...', total=settings.vocab_size)
+    bar = progress(settings, desc='Loading weights...', total=settings.vocab_size)
     with open(settings.glove_path, encoding='utf-8') as infile:
         for line in infile:
-            splits = line.split(' ')
+            if len(line) < 50:
+                # skip header lines, etc - makes it compatible with fasttext vectors as well
+                continue
+            splits = line.strip().split(' ')
             idx = word_to_idx(settings.vocab_size, splits[0])
             if idx in remaining:
                 bar.update(1)
@@ -188,7 +198,7 @@ def load_glove(settings):
                 remaining.remove(idx)
             if len(remaining) == 0:
                 break
-    logging.info('Done loading GLOVE weights.')
+    logging.info('Done loading embedding weights.')
     return torch.from_numpy(weights)
 
 
@@ -258,7 +268,7 @@ class Settings:
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 2, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
         'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
-        'context_mode': 'max',
+        'context_mode': 'maxavg',
     }
 
     default_defaults = {
@@ -438,7 +448,8 @@ def parse_args():
     parser.add_argument('--learn_rnn_init', action='store_true', default=env_flag('LEARN_RNN_INIT'),
                         help='Learn RNN initial state (default inits to tensor of 0s)')
     parser.add_argument('--context_mode', type=str, default=env('CONTEXT_MODE', str),
-                        help='How RNN context is turned into ')
+                        help='What goes between RNN output and dense layer, one of {attention, max,'
+                             ' maxavg, last}.  Default is maxavg.')
 
     parser.add_argument('--char_rnn', action='store_true',
                         help='Use a character RNN instead of word RNN')
