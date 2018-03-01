@@ -262,10 +262,10 @@ def get_classes(settings):
 class Settings:
     model_param_names = {'id', 'created_at', 'rnn', 'rnn_layers', 'char_rnn', 'bidirectional',
                          'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim',
-                         'learn_rnn_init', 'context_mode', 'lowercase', 'filter_chars'}
+                         'learn_rnn_init', 'context_mode', 'no_lowercase', 'filter_chars'}
     default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss_fn',
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
-                     'gradient_clip'}
+                     'gradient_clip', 'learn_class_weights'}
     transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path',
                        'model_path', 'preload_data', 'epoch_shell_callback'}
     comet_hparam_names = ['rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
@@ -278,13 +278,13 @@ class Settings:
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 2, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
         'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
-        'context_mode': 'maxavg', 'lowercase': False, 'filterchars': '',
+        'context_mode': 'maxavg', 'no_lowercase': False, 'filterchars': '',
     }
 
     default_defaults = {
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
         'loss_fn': 'CrossEntropy', 'embed_dropout': 0.3, 'context_dropout': 0.3,
-        'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None,
+        'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None, 'learn_class_weights': False,
     }
 
     transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False,
@@ -479,13 +479,17 @@ def parse_args():
     parser.add_argument('--token_regex', type=str,
                         default=env('TOKEN_REGEX', str),
                         help='Regexp pattern to tokenize with')
-    parser.add_argument('--lowercase', action='store_true', default=env_flag('LOWERCASE'),
-                        help='Lowercases all text in training and prediction.')
+    parser.add_argument('--no_lowercase', action='store_true', default=env_flag('NO_LOWERCASE'),
+                        help='Stops text from being lowercased in training and prediction.')
     parser.add_argument('--filter_chars', type=str, default='',
                         help='Removes all specified characters from input text')
 
     parser.add_argument('--classes', type=str,
                         help='Comma separated list of classes to predict')
+    parser.add_argument('--learn_class_weights', action='store_true',
+                        default=env_flag('LEARN_CLASS_WEIGHTS'),
+                        help='Learnings class weights from data automatically.  Helps in cases '
+                             'where class imbalance is a problem.')
     parser.add_argument('--class_weights', type=str,
                         default=env('CLASS_WEIGHTS', lambda s: s),
                         help='Comma separated list of class weights')
@@ -724,7 +728,7 @@ def get_tokenizer(settings):
         tokenizer = Tokenizer.load(tokenizer_path)
     else:
         tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
-                              settings.lowercase, settings.token_regex, settings.char_rnn)
+                              not settings.no_lowercase, settings.token_regex, settings.char_rnn)
         texts = pandas.read_csv(settings.input_path).text
         tokenizer.fit_on_texts(progress(settings, texts, desc='Learning vocab...', total=len(texts)))
         tokenizer.save(tokenizer_path)
