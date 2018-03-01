@@ -1,8 +1,11 @@
 #!/usr/bin/env python3.6
 import os
+import re
 from datetime import datetime
 from subprocess import check_output
 from uuid import uuid4
+import sqlite3
+import json
 
 import numpy
 
@@ -17,7 +20,6 @@ from unittest.mock import MagicMock
 import argparse
 import toolz
 import pandas
-import mmh3
 import logging
 import time
 
@@ -31,8 +33,7 @@ cudnn.benchmark = True
 import toml
 
 from sklearn import metrics
-from collections import deque
-from nltk.tokenize import RegexpTokenizer
+from collections import deque, OrderedDict
 from tqdm import tqdm
 tqdm.monitor_interval = 0  # https://github.com/tqdm/tqdm/issues/481
 
@@ -180,25 +181,32 @@ class WordRnn(nn.Module):
 def load_embedding_weights(settings):
     """ Load embeddings weights
     :param str path: path to load embedding weights from
+    :param Tokenizer tokenizer:
     :rtype: torch.FloatTensor
     """
     logging.info('Loading embeddings from {}'.format(settings.glove_path))
     remaining = set(range(1, settings.vocab_size))
     weights = numpy.zeros((settings.vocab_size, settings.embed_dim), dtype=float)
     bar = progress(settings, desc='Loading weights...', total=settings.vocab_size)
+    tokenizer = get_tokenizer(settings)
     with open(settings.glove_path, encoding='utf-8') as infile:
         for line in infile:
             if len(line) < 50:
                 # skip header lines, etc - makes it compatible with fasttext vectors as well
                 continue
-            splits = line.strip().split(' ')
-            idx = word_to_idx(settings.vocab_size, splits[0])
+            splits = line.strip('\n').split(' ')
+            idx = tokenizer.word_to_idx(splits[0])
             if idx in remaining:
                 bar.update(1)
                 weights[idx, :] = numpy.array(splits[1:], dtype=float)
                 remaining.remove(idx)
             if len(remaining) == 0:
                 break
+    if remaining:
+        logging.info('Filling remaining {} vocab words with random embeddings.'.format(
+            len(remaining)))
+        for idx in remaining:
+            weights[idx, :] = numpy.random.rand(settings.embed_dim)
     logging.info('Done loading embedding weights.')
     return torch.from_numpy(weights)
 
@@ -254,7 +262,7 @@ def get_classes(settings):
 class Settings:
     model_param_names = {'id', 'created_at', 'rnn', 'rnn_layers', 'char_rnn', 'bidirectional',
                          'classes', 'vocab_size', 'msg_len', 'context_dim', 'embed_dim',
-                         'learn_rnn_init', 'context_mode'}
+                         'learn_rnn_init', 'context_mode', 'lowercase', 'filter_chars'}
     default_names = {'batch_size', 'epochs', 'cuda', 'learning_rate', 'optimizer', 'loss_fn',
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
                      'gradient_clip'}
@@ -270,7 +278,7 @@ class Settings:
     model_param_defaults = {
         'rnn': 'gru', 'rnn_layers': 2, 'bidirectional': True, 'char_rnn': False, 'vocab_size': 1024,
         'msg_len': 40, 'context_dim': 32, 'embed_dim': 50, 'learn_rnn_init': False,
-        'context_mode': 'maxavg',
+        'context_mode': 'maxavg', 'lowercase': False, 'filterchars': '',
     }
 
     default_defaults = {
@@ -293,6 +301,9 @@ class Settings:
             return self.get(key)
         else:
             raise AttributeError("'Settings' has no an attribute '{}'.".format(key))
+
+    def __hash__(self):
+        return hash(self.to_toml())
 
     def get(self, key, default=None):
         if key in self.model_param_names:
@@ -468,6 +479,10 @@ def parse_args():
     parser.add_argument('--token_regex', type=str,
                         default=env('TOKEN_REGEX', str),
                         help='Regexp pattern to tokenize with')
+    parser.add_argument('--lowercase', action='store_true', default=env_flag('LOWERCASE'),
+                        help='Lowercases all text in training and prediction.')
+    parser.add_argument('--filter_chars', type=str, default='',
+                        help='Removes all specified characters from input text')
 
     parser.add_argument('--classes', type=str,
                         help='Comma separated list of classes to predict')
@@ -489,30 +504,231 @@ def parse_args():
     return parser.parse_args()
 
 
-@toolz.memoize
-def get_tokenizer(token_regex):
-    return RegexpTokenizer(token_regex)
-
-
-def word_to_idx(vocab_size, token):
-    """ Applies hashing trick to turn a word into its embedding idx
-    :param str token: tokenized word
-    :rtype: int
+class Tokenizer(object):
+    """Text tokenization utility class.
+    This class allows to vectorize a text corpus, by turning each
+    text into either a sequence of integers (each integer being the index
+    of a token in a dictionary) or into a vector where the coefficient
+    for each token could be binary, based on word count, based on tf-idf...
+    # Arguments
+        num_words: the maximum number of words to keep, based
+            on word frequency. Only the most common `num_words` words will
+            be kept.
+        filters: a string where each element is a character that will be
+            filtered from the texts. The default is all punctuation, plus
+            tabs and line breaks, minus the `'` character.
+        lower: boolean. Whether to convert the texts to lowercase.
+        split: character or string to use for token splitting.
+        char_level: if True, every character will be treated as a token.
+        oov_token: if given, it will be added to word_index and used to
+            replace out-of-vocabulary words during text_to_sequence calls
+    By default, all punctuation is removed, turning the texts into
+    space-separated sequences of words
+    (words maybe include the `'` character). These sequences are then
+    split into lists of tokens. They will then be indexed or vectorized.
+    `0` is a reserved index that won't be assigned to any word.
     """
-    return (mmh3.hash(token) % (vocab_size - 1)) + 1
+
+    def __init__(self, vocab_size=None, msg_len=100, filters='', lower=True,
+                 split=' ', char_rnn=False, oov_token=None):
+        self.word_counts = OrderedDict()
+        self.word_docs = {}
+        self.msg_len = msg_len
+        self.filters = filters
+        self.re_filter = re.compile('[' + re.escape(filters) + ']') if filters else None
+        self.split = split
+        self.re_split = re.compile(split)
+        self.lower = lower
+        self.vocab_size = vocab_size
+        self.document_count = 0
+        self.char_rnn = char_rnn
+        self.oov_token = oov_token
+        self.index_docs = {}
+        self.word_index = {}
+
+    @classmethod
+    def from_json(cls, toml_text):
+        """ Loads tokenizer and vocab from provided toml text """
+        jobj = json.loads(toml_text)
+        meta = jobj['meta']
+        tokenizer = cls(meta['vocab_size'], meta['msg_len'], meta['filters'], meta['lower'],
+                        meta['split'], meta['char_rnn'], meta.get('oov_token'))
+        tokenizer.document_count = meta['document_count']
+        tokenizer.word_counts = OrderedDict(jobj['word_counts'])
+        tokenizer.word_docs = jobj['word_docs']
+        tokenizer.word_index = jobj['word_index']
+        tokenizer.index_docs = {int(k): v for k, v in jobj['index_docs'].items()}
+        return tokenizer
+
+    @classmethod
+    def load(cls, path):
+        """ Loads JSON serialized tokenizer from path """
+        logging.info('Loading tokenizer from {}...'.format(path))
+        with open(path) as infile:
+            return cls.from_json(infile.read())
+
+    def to_json(self):
+        """ Serializes tokenizer and vocab to toml """
+        jobj = {
+            'meta': {
+                'msg_len': self.msg_len, 'filters': self.filters, 'split': self.split, 
+                'lower': self.lower, 'vocab_size': self.vocab_size, 'char_rnn': self.char_rnn,
+                'document_count': self.document_count, 'oov_token': self.oov_token,
+            },
+            'word_counts': dict(self.word_counts),
+            'word_docs': self.word_docs,
+            'index_docs': {str(k): v for k, v in self.index_docs.items()},
+            'word_index': self.word_index,
+        }
+        return json.dumps(jobj)
+    
+    def save(self, path):
+        """ Save JSON version of tokenizer to path """
+        logging.info('Saving tokenizer to {}...'.format(path))
+        json_text = self.to_json()
+        with open(path, 'w') as outfile:
+            outfile.write(json_text)
+
+    def text_to_word_sequence(self, text):
+        if self.lower:
+            text = text.lower()
+
+        if self.re_filter:
+            text = self.re_filter.sub('', text)
+
+        return [tok for tok in self.re_split.findall(text) if tok]
+
+    def word_to_idx(self, token):
+        if self.lower:
+            token = token.lower()
+        if self.re_filter:
+            token = self.re_filter.sub('', token)
+        return self.word_index.get(token)
+
+    def fit_on_texts(self, texts):
+        """Updates internal vocabulary based on a list of texts.
+        In the case where texts contains lists, we assume each entry of the lists
+        to be a token.
+        Required before using `texts_to_sequences` or `texts_to_matrix`.
+        # Arguments
+            texts: can be a list of strings,
+                a generator of strings (for memory-efficiency),
+                or a list of list of strings.
+        """
+        for text in texts:
+            self.document_count += 1
+            if self.char_rnn or isinstance(text, list):
+                seq = text
+            else:
+                seq = self.text_to_word_sequence(text)
+            for w in seq:
+                if w in self.word_counts:
+                    self.word_counts[w] += 1
+                else:
+                    self.word_counts[w] = 1
+            for w in set(seq):
+                if w in self.word_docs:
+                    self.word_docs[w] += 1
+                else:
+                    self.word_docs[w] = 1
+
+        wcounts = list(self.word_counts.items())
+        wcounts.sort(key=lambda x: x[1], reverse=True)
+        sorted_voc = [wc[0] for wc in wcounts]
+        # note that index 0 is reserved, never assigned to an existing word
+        self.word_index = dict(list(zip(sorted_voc, list(range(1, len(sorted_voc) + 1)))))
+
+        if self.oov_token is not None:
+            i = self.word_index.get(self.oov_token)
+            if i is None:
+                self.word_index[self.oov_token] = len(self.word_index) + 1
+
+        for w, c in list(self.word_docs.items()):
+            self.index_docs[self.word_index[w]] = c
+
+    def fit_on_sequences(self, sequences):
+        """Updates internal vocabulary based on a list of sequences.
+        Required before using `sequences_to_matrix`
+        (if `fit_on_texts` was never called).
+        # Arguments
+            sequences: A list of sequence.
+                A "sequence" is a list of integer word indices.
+        """
+        self.document_count += len(sequences)
+        for seq in sequences:
+            seq = set(seq)
+            for i in seq:
+                if i not in self.index_docs:
+                    self.index_docs[i] = 1
+                else:
+                    self.index_docs[i] += 1
+
+    def texts_to_sequences(self, texts):
+        """Transforms each text in texts in a sequence of integers.
+        Only top "num_words" most frequent words will be taken into account.
+        Only words known by the tokenizer will be taken into account.
+        # Arguments
+            texts: A list of texts (strings).
+        # Returns
+            A list of sequences.
+        """
+        res = []
+        for vect in self.texts_to_sequences_generator(texts):
+            res.append(vect)
+        return res
+
+    def texts_to_sequences_generator(self, texts):
+        """Transforms each text in `texts` in a sequence of integers.
+        Each item in texts can also be a list, in which case we assume each item of that list
+        to be a token.
+        Only top "num_words" most frequent words will be taken into account.
+        Only words known by the tokenizer will be taken into account.
+        # Arguments
+            texts: A list of texts (strings).
+        # Yields
+            Yields individual sequences.
+        """
+        num_words = self.vocab_size
+        for text in texts:
+            if self.char_rnn or isinstance(text, list):
+                seq = text
+            else:
+                seq = self.text_to_word_sequence(text)
+            vect = []
+            for w in seq:
+                i = self.word_index.get(w)
+                if i is not None:
+                    if num_words and i >= num_words:
+                        continue
+                    else:
+                        vect.append(i)
+                elif self.oov_token is not None:
+                    i = self.word_index.get(self.oov_token)
+                    if i is not None:
+                        vect.append(i)
+            yield vect
+
+    def transform_texts(self, texts):
+        sequences = self.texts_to_sequences(texts)
+        tensor = torch.zeros(self.msg_len, len(texts)).type(torch.LongTensor)
+        for row_idx, sequence in enumerate(sequences):
+            for col_idx, word_idx in enumerate(sequence[:self.msg_len]):
+                tensor[col_idx, row_idx] = word_idx
+        return Variable(tensor)
 
 
-def transform_texts(settings, texts):
-    """ Transforms texts based on provided args """
-    if settings.char_rnn:
-        raise NotImplementedError
+@toolz.memoize
+def get_tokenizer(settings):
+    tokenizer_path = settings.model_path + '.tokenizer.json'
+    if os.path.isfile(tokenizer_path):
+        tokenizer = Tokenizer.load(tokenizer_path)
     else:
-        tensor = torch.zeros(settings.msg_len, len(texts)).type(torch.LongTensor)
-        tokenizer = get_tokenizer(settings.token_regex)
-        for row_idx, text in enumerate(texts):
-            for col_idx, token in enumerate(toolz.take(settings.msg_len, tokenizer.tokenize(text))):
-                tensor[col_idx, row_idx] = word_to_idx(settings.vocab_size, token)
-    return Variable(tensor)
+        tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
+                              settings.lowercase, settings.token_regex, settings.char_rnn)
+        texts = pandas.read_csv(settings.input_path).text
+        tokenizer.fit_on_texts(progress(settings, texts, desc='Learning vocab...', total=len(texts)))
+        tokenizer.save(tokenizer_path)
+    return tokenizer
 
 
 def train_batch_iter(settings):
@@ -525,6 +741,7 @@ def dev_batch_iter(settings):
 
 def batch_iter_from_path(settings, path):
     """ Loads, transforms, and yields batches for training/testing/prediction """
+    tokenizer = get_tokenizer(settings)
     chunk_iter = iter(pandas.read_csv(path, chunksize=settings.batch_size,
                                       nrows=settings.get('limit')))
     while True:
@@ -537,20 +754,21 @@ def batch_iter_from_path(settings, path):
                 classes = torch.LongTensor(classes.values.argmax(axis=1))
             else:
                 classes = torch.FloatTensor(classes.values)
-            yield transform_texts(settings, real_chunk.text.values), \
+            yield tokenizer.transform_texts(real_chunk.text.values), \
                   Variable(classes)
         except pandas.errors.ParserError:
             pass
 
 
 def predict_batch_iter(settings):
+    tokenizer = get_tokenizer(settings)
     chunk_iter = iter(pandas.read_csv(settings.input_path, chunksize=settings.batch_size,
                                       header=None, nrows=settings.get('limit')))
     while True:
         try:
             chunk = next(chunk_iter)
             real_chunk = chunk.dropna(axis=0)
-            yield transform_texts(settings, real_chunk.loc[:, 0].values)
+            yield tokenizer.transform_texts(real_chunk.loc[:, 0].values)
         except pandas.errors.ParserError:
             pass
 
@@ -612,13 +830,14 @@ def train(args):
         model = WordRnn(settings)
         model.load_state_dict(torch.load(args.model_path + '.bin'))
         logging.info('Model loaded from {}, continuing training'.format(settings.model_path))
+    tokenizer = get_tokenizer(settings)
 
-    logging.info('Counting classes...')
-    class_counts = count_classes(settings)
     if settings.class_weights:
         logging.info('Class weights specified: {}'.format(settings.class_weights))
         class_weights = torch.FloatTensor(settings.class_weights)
-    else:
+    elif settings.learn_class_weights:
+        logging.info('Learning class weights...')
+        class_counts = count_classes(settings)
         class_weights = torch.FloatTensor([sum(class_counts.values()) / class_counts[c]
                                            for c in get_classes(settings)])
         class_weights /= class_weights.min()
@@ -626,6 +845,8 @@ def train(args):
             "Didn't find any examples of any classes (input iterator was empty)"
         logging.info('Inferred class weights: {}'.format(class_weights))
         settings.defaults['class_weights'] = list(class_weights)
+    else:
+        class_weights = torch.FloatTensor([1.0] * len(get_classes(settings)))
 
     if settings.cuda:
         class_weights = class_weights.cuda()
@@ -663,7 +884,7 @@ def train(args):
         if settings.preload_data:
             train_batches = list(progress(
                 settings, train_batch_iter(settings), desc='Loading train batches...',
-                total=int(sum(class_counts.values())/settings.batch_size)))
+                total=int(tokenizer.document_count/settings.batch_size)))
 
             dev_batches = list(progress(settings, dev_batch_iter(settings),
                                         desc='Loading dev batches...')) \
@@ -674,7 +895,7 @@ def train(args):
         for epoch in range(settings.epochs):
             model.train()
             train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment,
-                        class_counts, train_batches, sle)
+                        train_batches, sle)
             if settings.get('validate_path'):
                 model.eval()
                 val_loss = score_model(settings, model, criterion, epoch, comet_experiment,
@@ -690,9 +911,9 @@ def train(args):
         pass
 
 
-def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, class_counts,
-                train_batches, sle):
+def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, train_batches, sle):
     """ Trains a single epoch """
+    tokenizer = get_tokenizer(settings)
     comet_experiment.log_current_epoch(epoch)
     loss_queue = deque(maxlen=100)
     all_losses = []
@@ -701,7 +922,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
     epoch_period = 1
     started = datetime.now()
 
-    progress = tqdm(desc='Epoch {}'.format(epoch), total=sum(class_counts.values())) \
+    progress = tqdm(desc='Epoch {}'.format(epoch), total=tokenizer.document_count) \
         if settings.verbose == 1 else MagicMock()
 
     for step, (batch_x, batch_y) in enumerate(train_batches or train_batch_iter(settings)):
@@ -818,17 +1039,16 @@ def predict(settings, model, texts):
     :rtype: iter
     """
     started = datetime.now()
+    tokenizer = get_tokenizer(settings)
     for batch in toolz.partition_all(settings.batch_size, texts):
-        output = predict_batch(model, transform_texts(settings, batch)).data
+        output = predict_batch(model, tokenizer.transform_texts(batch)).data
         yield from map(lambda idx: settings.classes[idx], output.max(1)[1].numpy())
     logging.info('Made {} predictions in {} seconds.'.format(
         len(texts), (datetime.now() - started).total_seconds()))
 
 
-import sqlite3
-
 class SqliteExperiment:
-    def __init__(self, hparams, metrics, log_every=None, experiment_id=None):
+    def __init__(self, hparams, metrics, experiment_id=None):
         self.experiment_id = experiment_id or str(uuid4())
         self.hparams = hparams
         self.metrics = metrics
