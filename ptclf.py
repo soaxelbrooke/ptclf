@@ -67,7 +67,7 @@ class WordRnn(nn.Module):
                                                          self.embed_size)
 
         self.embedding = nn.Embedding(self.input_size, self.embed_size, padding_idx=0)
-        if settings.glove_path:
+        if settings.glove_path and not settings.continued:
             self.embedding.weight.data.copy_(load_embedding_weights(settings))
 
         self.embed_dropout = nn.Dropout2d(settings.embed_dropout)
@@ -267,7 +267,7 @@ class Settings:
                      'embed_dropout', 'context_dropout', 'token_regex', 'class_weights',
                      'gradient_clip', 'learn_class_weights'}
     transient_names = {'input_path', 'validate_path', 'verbose', 'limit', 'glove_path',
-                       'model_path', 'preload_data', 'epoch_shell_callback'}
+                       'model_path', 'preload_data', 'epoch_shell_callback', 'continued'}
     comet_hparam_names = ['rnn', 'rnn_layers', 'char_rnn', 'bidirectional', 'classes', 'vocab_size',
                           'msg_len', 'context_dim', 'embed_dim', 'batch_size', 'epochs', 'cuda',
                           'learning_rate', 'optimizer', 'loss_fn', 'embed_dropout',
@@ -729,7 +729,7 @@ def get_tokenizer(settings):
     else:
         tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
                               not settings.no_lowercase, settings.token_regex, settings.char_rnn)
-        texts = pandas.read_csv(settings.input_path).text
+        texts = pandas.read_csv(settings.input_path).text.dropna()
         tokenizer.fit_on_texts(progress(settings, texts, desc='Learning vocab...', total=len(texts)))
         tokenizer.save(tokenizer_path)
     return tokenizer
