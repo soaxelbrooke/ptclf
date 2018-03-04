@@ -1,11 +1,12 @@
 #!/usr/bin/env python3.6
+import json
 import os
 import re
+import sqlite3
+from copy import deepcopy
 from datetime import datetime
 from subprocess import check_output
 from uuid import uuid4
-import sqlite3
-import json
 
 import numpy
 
@@ -28,6 +29,7 @@ from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 from torch.backends import cudnn
+
 cudnn.benchmark = True
 
 import toml
@@ -35,6 +37,7 @@ import toml
 from sklearn import metrics
 from collections import deque, OrderedDict
 from tqdm import tqdm
+
 tqdm.monitor_interval = 0  # https://github.com/tqdm/tqdm/issues/481
 
 
@@ -86,9 +89,9 @@ class WordRnn(nn.Module):
         elif self.rnn_kind == 'lstm':
             if settings.learn_rnn_init:
                 self.rnn_init_h1 = nn.Parameter(
-                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor),requires_grad=True)
+                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor), requires_grad=True)
                 self.rnn_init_h2 = nn.Parameter(
-                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor),requires_grad=True)
+                    torch.randn(*rnn_hidden_shape).type(torch.FloatTensor), requires_grad=True)
             else:
                 self.rnn_init_h1 = Variable(torch.zeros(
                     self.rnn_layers * (1 + int(self.bidirectional)), 1, self.context_size))
@@ -379,6 +382,10 @@ class Settings:
 
         return model_settings, defaults, transients
 
+    def copy(self):
+        return Settings(deepcopy(self.model_settings), deepcopy(self.defaults),
+                        deepcopy(self.transients))
+
     @classmethod
     def from_args(cls, args):
         """ Create new settings from command line args and env vars.
@@ -440,12 +447,14 @@ def parse_args():
     parser.add_argument('--verbose', type=int, default=env('VERBOSE', int),
                         help='Verbosity of model. 0 = silent, 1 = progress bar, 2 = one line '
                              'per epoch.')
+    parser.add_argument('--hyperopt_spec', type=str)
 
     parser.add_argument('--learning_rate', type=float, default=env('LEARNING_RATE', float))
     parser.add_argument('--gradient_clip', type=float, default=env('GRADIENT_CLIP', float))
     parser.add_argument('--optimizer', type=str, default=env('OPTIMIZER', str),
                         help='One of {sgd, adam}')
-    parser.add_argument('--loss_fn', type=str, default=env('LOSS_FN', str)) # TODO add help details for other loss functions
+    parser.add_argument('--loss_fn', type=str, default=env('LOSS_FN',
+                                                           str))  # TODO add help details for other loss functions
     parser.add_argument('--embed_dropout', type=float, default=env('EMBED_DROPOUT', float),
                         help='Dropout used for embedding layer')
     parser.add_argument('--context_dropout', type=float, default=env('CONTEXT_DROPOUT', float),
@@ -575,7 +584,7 @@ class Tokenizer(object):
         """ Serializes tokenizer and vocab to toml """
         jobj = {
             'meta': {
-                'msg_len': self.msg_len, 'filters': self.filters, 'split': self.split, 
+                'msg_len': self.msg_len, 'filters': self.filters, 'split': self.split,
                 'lower': self.lower, 'vocab_size': self.vocab_size, 'char_rnn': self.char_rnn,
                 'document_count': self.document_count, 'oov_token': self.oov_token,
             },
@@ -585,7 +594,7 @@ class Tokenizer(object):
             'word_index': self.word_index,
         }
         return json.dumps(jobj)
-    
+
     def save(self, path):
         """ Save JSON version of tokenizer to path """
         logging.info('Saving tokenizer to {}...'.format(path))
@@ -727,10 +736,12 @@ def get_tokenizer(settings):
     if os.path.isfile(tokenizer_path):
         tokenizer = Tokenizer.load(tokenizer_path)
     else:
+        logging.info('Learning vocab...')
         tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
                               not settings.no_lowercase, settings.token_regex, settings.char_rnn)
         texts = pandas.read_csv(settings.input_path).text.dropna()
-        tokenizer.fit_on_texts(progress(settings, texts, desc='Learning vocab...', total=len(texts)))
+        tokenizer.fit_on_texts(
+            progress(settings, texts, desc='Learning vocab...', total=len(texts)))
         tokenizer.save(tokenizer_path)
     return tokenizer
 
@@ -814,6 +825,41 @@ def count_classes(settings):
     return df[df.columns[1:]].sum(axis=0).to_dict()
 
 
+def hyperopt(args):
+    from bayes_opt import BayesianOptimization
+
+    settings = Settings.from_args(args)
+    with open(args.hyperopt_spec) as infile:
+        spec = toml.load(infile)
+
+    def run_hyperopt_experiment(**kwargs):
+        """ Creates a settings TOML file and trains a model using it """
+        for k, v in kwargs.items():
+            if 'dropout' not in k and isinstance(v, float):
+                kwargs[k] = int(v)
+        experiment_id = uuid4()
+        logging.info('Running experiment {}...'.format(experiment_id))
+        experiment_settings = settings.copy()
+        experiment_settings.model_settings['id'] = experiment_id
+        for key, value in kwargs.items():
+            experiment_settings.model_settings[key] = value
+        settings_path = 'model-{}.toml'.format(experiment_id)
+        experiment_settings.save(settings_path)
+        check_output(['python3.6', 'ptclf.py', 'train', '--verbose', '2', '-m', settings_path[:-5],
+                      '-i', settings.input_path, '--validate_path', settings.validate_path])
+
+        con = sqlite3.connect('experiments.sqlite')
+        results = con.execute(
+            "select dev_loss from metrics where experiment_id='{}' and dev_loss not null order by epoch desc limit 1".format(
+                experiment_id))
+        return list(results)[0][0]
+
+    gp_params = {"alpha": 1e-5, "n_restarts_optimizer": 2}
+    bayes_opt = BayesianOptimization(run_hyperopt_experiment, spec['bounds'])
+    # bayes_opt.explore(spec['points'])
+    bayes_opt.maximize(n_iter=25, acq="ucb", kappa=5, **gp_params)
+
+
 def train(args):
     """ Trains RNN based on provided arguments """
     settings = Settings.from_args(args)
@@ -827,7 +873,7 @@ def train(args):
         [('loss', float), ('dev_loss', float), ('epoch', int), ('samples_seen', int),
          ('acc', float), ('dev_acc', float), ('train_per_second', float),
          ('score_per_second', float)],
-        os.environ.get('EXPERIMENT_ID'))
+        os.environ.get('EXPERIMENT_ID', settings.id))
     sle.log_hparams(settings.to_comet_hparams())
     model = build_model(settings)
     if args.continued:
@@ -888,7 +934,7 @@ def train(args):
         if settings.preload_data:
             train_batches = list(progress(
                 settings, train_batch_iter(settings), desc='Loading train batches...',
-                total=int(tokenizer.document_count/settings.batch_size)))
+                total=int(tokenizer.document_count / settings.batch_size)))
 
             dev_batches = list(progress(settings, dev_batch_iter(settings),
                                         desc='Loading dev batches...')) \
@@ -1132,20 +1178,23 @@ insert into metrics ({}) values ({})
 def main():
     args = parse_args()
 
-    logging.basicConfig(format='%(levelname)s:%(asctime)s.%(msecs)03d [%(threadName)s] - %(message)s',
-                        datefmt='%Y-%m-%d,%H:%M:%S',
-                        filename=os.environ.get('LOG_PATH'),
-                        level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO')))
+    logging.basicConfig(
+        format='%(levelname)s:%(asctime)s.%(msecs)03d [%(threadName)s] - %(message)s',
+        datefmt='%Y-%m-%d,%H:%M:%S',
+        filename=os.environ.get('LOG_PATH'),
+        level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO')))
 
     if args.mode == 'train':
         train(args)
+    elif args.mode == 'hyperopt':
+        hyperopt(args)
     elif args.mode == 'predict':
         stdout_predict(args)
     elif args.mode == 'predict2':
         settings, model = load_settings_and_model('model')
         examples = [
-            'This is great!', 
-            'Sometimes things just don\'t work out.', 
+            'This is great!',
+            'Sometimes things just don\'t work out.',
             'Nothing to complain about!',
             'It defeinitely lives up to the hype!',
             'After everything people said, a definite disappointment.  Hopefully they do better next time.',
@@ -1153,11 +1202,10 @@ def main():
             'New and improved, and now completely unusable since update. Zestimate is under a heading "Home Value" It is fraudulent and misleading and needs to be eliminated.',
             'Spammy. When you share something instead of a URL it dumps half a page of ad text and app links. Then it signs your email up for reports on that property. Geez, forbid I share a listing with a friend... Going to just find something less spam filled.',
         ]
-        results = list(predict(settings, model, examples)) 
+        results = list(predict(settings, model, examples))
         for example, result in zip(examples, results):
             print(example, '=>', result)
 
 
 if __name__ == '__main__':
     main()
-
