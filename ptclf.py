@@ -632,6 +632,7 @@ class Tokenizer(object):
                 a generator of strings (for memory-efficiency),
                 or a list of list of strings.
         """
+        logging.info('Counting documents and words...')
         for text in texts:
             self.document_count += 1
             if self.char_rnn or isinstance(text, list):
@@ -649,10 +650,12 @@ class Tokenizer(object):
                 else:
                     self.word_docs[w] = 1
 
+        logging.info('Sorting word counts...')
         wcounts = list(self.word_counts.items())
         wcounts.sort(key=lambda x: x[1], reverse=True)
         sorted_voc = [wc[0] for wc in wcounts]
         # note that index 0 is reserved, never assigned to an existing word
+        logging.info('Zipping vocab with word indexes...')
         self.word_index = dict(list(zip(sorted_voc, list(range(1, len(sorted_voc) + 1)))))
 
         if self.oov_token is not None:
@@ -660,8 +663,11 @@ class Tokenizer(object):
             if i is None:
                 self.word_index[self.oov_token] = len(self.word_index) + 1
 
+        logging.info('Setting doc indexes...')
         for w, c in list(self.word_docs.items()):
             self.index_docs[self.word_index[w]] = c
+
+        logging.info('Done fitting tokenizer.')
 
     def fit_on_sequences(self, sequences):
         """Updates internal vocabulary based on a list of sequences.
@@ -767,7 +773,6 @@ def batch_iter_from_path(settings, path):
         try:
             chunk = next(chunk_iter)
             real_chunk = chunk.dropna(axis=0)
-            # real_chunk = real_chunk[real_chunk[real_chunk.columns[1:]].sum(axis=1) > 0]
             classes = real_chunk[real_chunk.columns[1:]]
             if settings.loss_fn == 'CrossEntropy' or settings.loss_fn == 'NLL':
                 classes = torch.LongTensor(classes.values.argmax(axis=1))
