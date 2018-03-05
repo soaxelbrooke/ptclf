@@ -452,6 +452,7 @@ def parse_args():
                         help='Verbosity of model. 0 = silent, 1 = progress bar, 2 = one line '
                              'per epoch.')
     parser.add_argument('--hyperopt_spec', type=str)
+    parser.add_argument('--random_seed', type=int)
 
     parser.add_argument('--learning_rate', type=float, default=env('LEARNING_RATE', float))
     parser.add_argument('--gradient_clip', type=float, default=env('GRADIENT_CLIP', float))
@@ -871,6 +872,10 @@ def hyperopt(args):
 
 def train(args):
     """ Trains RNN based on provided arguments """
+    if args.random_seed:
+        torch.manual_seed(args.random_seed)
+        numpy.random.seed(args.random_seed)
+
     settings = Settings.from_args(args)
     sle = SqliteExperiment(
         [('rnn', str), ('rnn_layers', int), ('char_rnn', bool), ('bidirectional', bool),
