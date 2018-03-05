@@ -201,7 +201,11 @@ def load_embedding_weights(settings):
             idx = tokenizer.word_to_idx(splits[0])
             if idx in remaining:
                 bar.update(1)
-                weights[idx, :] = numpy.array(splits[1:], dtype=float)
+                try:
+                    weights[idx, :] = numpy.array(splits[1:settings.embed_dim+1], dtype=float)
+                except ValueError:
+                    logging.error('Failed to convert the following line:\n{}'.format(splits))
+                    raise
                 remaining.remove(idx)
             if len(remaining) == 0:
                 break
