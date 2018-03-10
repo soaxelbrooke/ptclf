@@ -110,12 +110,20 @@ class WordRnn(nn.Module):
 
         if self.cuda:
             logging.info('CUDA selected, changing components to CUDA...')
-            self.embedding.cuda()
-            self.rnn.cuda()
-            self.dense.cuda()
+            self.switch_to_gpu()
 
         logging.info('Initializing weights...')
         self.init_weights()
+
+    def switch_to_cpu(self):
+        self.embedding.cpu()
+        self.rnn.cpu()
+        self.dense.cpu()
+
+    def switch_to_gpu(self):
+        self.embedding.cuda()
+        self.rnn.cuda()
+        self.dense.cuda()
 
     def attend_to(self, context: torch.FloatTensor, embedded: torch.FloatTensor, smooth=True):
         similarities = torch.bmm(
@@ -130,7 +138,8 @@ class WordRnn(nn.Module):
         :rtype: WordRnn
         """
         model = cls(settings)
-        model.load_state_dict(torch.load(settings.model_path + '.bin'))
+        torch_data = torch.load(settings.model_path + '.bin', map_location=None)
+        model.load_state_dict(torch_data)
         return model
 
     def init_weights(self):
@@ -746,14 +755,17 @@ def get_tokenizer(settings):
     tokenizer_path = settings.model_path + '.tokenizer.json'
     if os.path.isfile(tokenizer_path):
         tokenizer = Tokenizer.load(tokenizer_path)
-    else:
-        logging.info('Learning vocab...')
-        tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
-                              not settings.no_lowercase, settings.token_regex, settings.char_rnn)
-        texts = pandas.read_csv(settings.input_path).text.dropna()
-        tokenizer.fit_on_texts(
-            progress(settings, texts, desc='Learning vocab...', total=len(texts)))
-        tokenizer.save(tokenizer_path)
+        if tokenizer.vocab_size == settings.vocab_size:
+            return tokenizer
+        logging.info('Found tokenizer had wrong vocab size ({}), wanted {}.'.format(
+            tokenizer.vocab_size, settings.vocab_size))
+    logging.info('Learning vocab...')
+    tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
+                          not settings.no_lowercase, settings.token_regex, settings.char_rnn)
+    texts = pandas.read_csv(settings.input_path).text.dropna()
+    tokenizer.fit_on_texts(
+        progress(settings, texts, desc='Learning vocab...', total=len(texts)))
+    tokenizer.save(tokenizer_path)
     return tokenizer
 
 
@@ -965,7 +977,11 @@ def train(args):
                 val_loss = score_model(settings, model, criterion, epoch, comet_experiment,
                                        dev_batches, sle)
                 scheduler.step(val_loss, epoch=epoch)
+            if settings.cuda:
+                model.switch_to_cpu()
             torch.save(model.state_dict(), settings.model_path + '.bin')
+            if settings.cuda:
+                model.switch_to_gpu()
             settings.save(settings.model_path + '.toml')
             logging.info('Model saved at {}'.format(settings.model_path))
             if settings.epoch_shell_callback:
