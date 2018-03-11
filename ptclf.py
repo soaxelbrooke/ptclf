@@ -592,7 +592,9 @@ class Tokenizer(object):
         """ Loads JSON serialized tokenizer from path """
         logging.info('Loading tokenizer from {}...'.format(path))
         with open(path) as infile:
-            return cls.from_json(infile.read())
+            tok = cls.from_json(infile.read())
+        logging.info('Done loading tokenizer.')
+        return tok
 
     def to_json(self):
         """ Serializes tokenizer and vocab to toml """
@@ -676,6 +678,9 @@ class Tokenizer(object):
         logging.info('Setting doc indexes...')
         for w, c in list(self.word_docs.items()):
             self.index_docs[self.word_index[w]] = c
+
+        logging.info('Trimming vocab...')
+
 
         logging.info('Done fitting tokenizer.')
 
@@ -968,6 +973,7 @@ def train(args):
         else:
             train_batches = None
             dev_batches = None
+        logging.info('Beginning training.')
         for epoch in range(settings.epochs):
             model.train()
             train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment,
