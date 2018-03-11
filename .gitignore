@@ -99,3 +99,12 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+
+experiments.sqlite
+Pipfile.lock
+test_glove_load.sh
+tox-hyperopt.sh
+upload_model.sh
+hyperopt.sh
+hyperopt_spec.toml
