@@ -102,7 +102,10 @@ class Tokenizer(object):
         """
         word_indexes_insert = "insert into tokenizer_word_indexes VALUES (?, ?);"
 
-        sqlite_con.execute('drop table tokenizer_config;')
+        try:
+            sqlite_con.execute('drop table tokenizer_config;')
+        except sqlite3.OperationalError:
+            pass
         sqlite_con.execute(config_table_create)
         sqlite_con.execute(config_insert, [
             self.vocab_size, self.msg_len, self.filters, self.lower, self.split, self.char_rnn,
