@@ -106,7 +106,7 @@ def load_settings_and_model(path: str, args=None) -> (Settings, 'WordRnn'):
 
 def convert_vecs_to_sqlite(vec_path):
     """ Converts pretrained embeddings like GLOVE to sqlite. """
-    sqlite_con = sqlite3.connect(vec_path.rsplit('.')[0] + '.sqlite')
+    sqlite_con = sqlite3.connect(vec_path.rsplit('.', 1)[0] + '.sqlite')
     try:
         sqlite_con.execute('drop table vectors;')
     except:
