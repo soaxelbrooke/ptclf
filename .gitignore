@@ -108,3 +108,5 @@ tox-hyperopt.sh
 upload_model.sh
 hyperopt.sh
 hyperopt_spec.toml
+
+test/.pytest_cache
