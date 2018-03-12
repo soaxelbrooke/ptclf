@@ -110,3 +110,7 @@ hyperopt.sh
 hyperopt_spec.toml
 
 test/.pytest_cache
+
+models/
+.idea/
+.pytest_cache/
