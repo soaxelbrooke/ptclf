@@ -7,6 +7,7 @@ never loaded in `train` mode.
 import csv
 from copy import deepcopy
 from datetime import datetime
+from typing import Optional
 from uuid import uuid4
 import argparse
 
@@ -241,7 +242,7 @@ class Settings:
         return {name: self.get(name) for name in self.comet_hparam_names}
 
 
-def parse_args():
+def parse_args(args: Optional=None):
     """ Parses command line args and env vars and adds them to current settings. """
     parser = argparse.ArgumentParser(description='ptclf - Pytorch Text Classifier')
 
@@ -328,4 +329,4 @@ def parse_args():
                         default=env('EPOCH_SHELL_CALLBACK', str))
     parser.add_argument('--predict_top', action='store_true')
 
-    return parser.parse_args()
+    return parser.parse_args(args)
