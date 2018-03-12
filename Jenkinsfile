@@ -3,10 +3,14 @@ pipeline {
 
     stages {
         stage('Build') {
-            sh 'pipenv install'
+            steps {
+                sh 'pipenv install'
+            }
         }
         stage('Test') {
-            sh 'pipenv run pytest'
+            steps {
+                sh 'pipenv run pytest'
+            }
         }
     }
 }
