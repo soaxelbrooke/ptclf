@@ -13,7 +13,8 @@ def test_basic_multiclass():
                       '--validate_path', 'assets/sentiment.csv']))
 
 
-@settings(max_examples=int(os.environ.get('RNN_TEST_DRAWS', 1)))
+@settings(max_examples=int(os.environ.get('RNN_TEST_DRAWS', 1)),
+          deadline=int(os.environ.get('RNN_TEST_DEADLINE_MS', 1000)))
 @given(
     s.one_of([s.just(v) for v in ('lstm', 'gru')]),
     s.one_of([s.just(v) for v in ('last', 'max', 'maxavg', 'attention')]),
