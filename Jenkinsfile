@@ -4,12 +4,12 @@ pipeline {
     stages {
         stage('Build') {
             steps {
-                sh 'python -m pipenv install'
+                sh 'python -m pipenv install --dev'
             }
         }
         stage('Test') {
             steps {
-                sh 'python -m pipenv run pytest'
+                sh 'PYTHONPATH=$(pwd) python -m pipenv run pytest'
             }
         }
     }
