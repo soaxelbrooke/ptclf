@@ -5,10 +5,16 @@ import logging
 import re
 from collections import OrderedDict
 from typing import Optional
+import sqlite3
 from sqlite3 import Connection
 
+
+import pandas
+import toolz
 import torch
 from torch.autograd import Variable
+
+from ptclf.util import progress
 
 
 class Tokenizer(object):
@@ -224,3 +230,25 @@ class Tokenizer(object):
             for col_idx, word_idx in enumerate(sequence[:self.msg_len]):
                 tensor[col_idx, row_idx] = word_idx
         return Variable(tensor)
+
+
+@toolz.memoize
+def get_tokenizer(settings):
+    sqlite_con = sqlite3.connect(settings.model_path + '.sqlite')
+    try:
+        tokenizer = Tokenizer.load(sqlite_con)
+        if tokenizer.vocab_size == settings.vocab_size:
+            return tokenizer
+        logging.debug('Found tokenizer had wrong vocab size ({}), wanted {}.'.format(
+            tokenizer.vocab_size, settings.vocab_size))
+    except:
+        pass
+    logging.debug('Learning vocab...')
+    tokenizer = Tokenizer(settings.vocab_size, settings.msg_len, settings.filter_chars,
+                          not settings.no_lowercase, settings.token_regex, settings.char_rnn)
+    texts = pandas.read_csv(settings.input_path).text.dropna()
+    tokenizer.fit_on_texts(
+        progress(settings, texts, desc='Learning vocab...', total=len(texts)))
+    tokenizer.save(sqlite_con)
+    return tokenizer
+

@@ -4,6 +4,7 @@ command line args or environment variables.  Once a model has been trained, the 
 can be overridden are batch size, shell callbacks, data preloading, and CUDA usage.  Settings are
 never loaded in `train` mode.
 """
+import csv
 from copy import deepcopy
 from datetime import datetime
 from uuid import uuid4
@@ -54,6 +55,7 @@ class Settings:
         'epochs': 1, 'batch_size': 16, 'learning_rate': 0.005, 'optimizer': 'adam',
         'loss_fn': 'CrossEntropy', 'embed_dropout': 0.3, 'context_dropout': 0.3,
         'token_regex': r'\w+|\$[\d\.]+|\S+', 'gradient_clip': None, 'learn_class_weights': False,
+        'cuda': False,
     }
 
     transient_defaults = {'verbose': 1, 'glove_path': None, 'preload_data': False,
@@ -95,6 +97,14 @@ class Settings:
         for name, default in self.transient_defaults.items():
             if self.transients.get(name) is None:
                 self.transients[name] = default
+
+        if self.model_settings.get('classes') is None:
+            with open(self.transients['input_path']) as infile:
+                header = next(iter(csv.reader(infile)))
+            self.model_settings['classes'] = [val for val in header if val != 'text']
+
+        if self.defaults.get('class_weights') is None:
+            self.defaults['class_weights'] = [1.0 for _ in self.model_settings['classes']]
 
     def to_sql_insert(self):
         all_columns = self._model_param_names + self._default_names
@@ -161,6 +171,7 @@ class Settings:
         """
 
         crs = sqlite_con.cursor()
+        crs.execute('DROP TABLE IF EXISTS settings;')
         crs.execute(table_create)
         crs.execute(*self.to_sql_insert())
         sqlite_con.commit()
