@@ -3,7 +3,6 @@ import logging
 import sqlite3
 
 import numpy
-import pandas
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -147,8 +146,10 @@ class WordRnn(nn.Module):
             context = rnn_context[-1]
         elif self.context_mode == 'maxavg':
             context = torch.cat([torch.max(rnn_context, 0)[0], torch.mean(rnn_context, 0)], 1)
-        else:
+        elif self.context_mode == 'max':
             context = torch.max(rnn_context, 0)[0]
+        else:
+            raise ValueError('Invalid context_mode specified: {}'.format(self.context_mode))
         # context shape: (msg_len, batch_size, context_size)
         # hidden shape: (rnn_depth, batch_size, context_size)
         dense = self.dense(context)
@@ -208,12 +209,6 @@ def load_embedding_weights_sqlite(settings):
     weights = numpy.random.randn(settings.vocab_size, settings.embed_dim)
     for token, *rest in sqlite_con.execute(embeddings_query):
         weights[tokenizer.word_to_idx(token) - 1, :] = rest
-    # df = pandas.read_sql(embeddings_query, sqlite_con)
-    # for token, idx in tokenizer.word_index.items():
-    #     if token in df.index:
-    #         weights[idx, :] = df.loc[token].values
-    #     else:
-    #         weights[idx, :] = numpy.random.rand(settings.embed_dim)
     return weights
 
 def load_embedding_weights(settings):

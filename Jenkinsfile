@@ -9,7 +9,7 @@ pipeline {
         }
         stage('Test') {
             steps {
-                sh 'PYTHONPATH=$(pwd) python -m pipenv run pytest'
+                sh 'RNN_TEST_DRAWS=50 PYTHONPATH=$(pwd) python -m pipenv run pytest'
             }
         }
     }
