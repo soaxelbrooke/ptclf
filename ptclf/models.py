@@ -1,7 +1,9 @@
 """  """
 import logging
+import sqlite3
 
 import numpy
+import pandas
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -168,13 +170,7 @@ class WordRnn(nn.Module):
             return init1.cuda() if self.cuda else init1, init2.cuda() if self.cuda else init2
 
 
-def load_embedding_weights(settings):
-    """ Load embeddings weights
-    :param str path: path to load embedding weights from
-    :param Tokenizer tokenizer:
-    :rtype: torch.FloatTensor
-    """
-    logging.debug('Loading embeddings from {}'.format(settings.glove_path))
+def load_embedding_weights_flat(settings):
     remaining = set(range(1, settings.vocab_size))
     weights = numpy.zeros((settings.vocab_size, settings.embed_dim), dtype=float)
     bar = progress(settings, desc='Loading weights...', total=settings.vocab_size)
@@ -189,7 +185,7 @@ def load_embedding_weights(settings):
             if idx in remaining:
                 bar.update(1)
                 try:
-                    weights[idx, :] = numpy.array(splits[1:settings.embed_dim+1], dtype=float)
+                    weights[idx, :] = numpy.array(splits[1:settings.embed_dim + 1], dtype=float)
                 except ValueError:
                     logging.error('Failed to convert the following line:\n{}'.format(splits))
                     raise
@@ -201,5 +197,35 @@ def load_embedding_weights(settings):
             len(remaining)))
         for idx in remaining:
             weights[idx, :] = numpy.random.rand(settings.embed_dim)
+    return weights
+
+
+def load_embedding_weights_sqlite(settings):
+    sqlite_con = sqlite3.connect(settings.glove_path)
+    tokenizer = get_tokenizer(settings)
+    embeddings_query = """select * from vectors where token in ({})""".format(', '.join(
+        "'{}'".format(token) for token in tokenizer.word_index if "'" not in token))
+    weights = numpy.random.randn(settings.vocab_size, settings.embed_dim)
+    for token, *rest in sqlite_con.execute(embeddings_query):
+        weights[tokenizer.word_to_idx(token) - 1, :] = rest
+    # df = pandas.read_sql(embeddings_query, sqlite_con)
+    # for token, idx in tokenizer.word_index.items():
+    #     if token in df.index:
+    #         weights[idx, :] = df.loc[token].values
+    #     else:
+    #         weights[idx, :] = numpy.random.rand(settings.embed_dim)
+    return weights
+
+def load_embedding_weights(settings):
+    """ Load embeddings weights
+    :param str path: path to load embedding weights from
+    :param Tokenizer tokenizer:
+    :rtype: torch.FloatTensor
+    """
+    logging.debug('Loading embeddings from {}'.format(settings.glove_path))
+    if settings.glove_path.endswith('.sqlite'):
+        weights = load_embedding_weights_sqlite(settings)
+    else:
+        weights = load_embedding_weights_flat(settings)
     logging.debug('Done loading embedding weights.')
     return torch.from_numpy(weights)

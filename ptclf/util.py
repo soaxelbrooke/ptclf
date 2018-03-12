@@ -102,3 +102,43 @@ def load_settings_and_model(path: str, args=None) -> (Settings, 'WordRnn'):
     model = WordRnn.load(settings)
     model.eval()
     return settings, model
+
+
+def convert_vecs_to_sqlite(vec_path):
+    """ Converts pretrained embeddings like GLOVE to sqlite. """
+    sqlite_con = sqlite3.connect(vec_path.rsplit('.')[0] + '.sqlite')
+    try:
+        sqlite_con.execute('drop table vectors;')
+    except:
+        pass
+
+    with open(vec_path) as infile:
+        _line = next(infile).split(' ')
+    if len(_line) == 2:
+        is_fasttext = True
+        embed_dim = int(_line[1])
+    else:
+        is_fasttext = False
+        embed_dim = len(_line) - 1
+
+    table_create_query = """
+        create table vectors (token text, {});
+    """.format(', '.join("d{} real".format(idx) for idx in range(embed_dim)))
+    insert_query = """
+        insert into vectors values ({});
+    """.format(', '.join(['?'] * (embed_dim + 1)))
+
+    sqlite_con.execute(table_create_query)
+    sqlite_con.execute('create index token_idx on vectors (token);')
+    with open(vec_path) as infile:
+        if is_fasttext:
+            next(infile)
+        for batch in toolz.partition_all(1000, infile):
+            rows = []
+            for line in batch:
+                token, *rest = line.rstrip().rsplit(' ', embed_dim)
+                row = [float(val) for val in rest]
+                row.insert(0, token)
+                rows.append(row)
+            sqlite_con.executemany(insert_query, rows)
+    sqlite_con.commit()

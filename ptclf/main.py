@@ -6,7 +6,7 @@ from ptclf.hyperopt import hyperopt
 from ptclf.predict import stdout_predict, predict
 from ptclf.settings import parse_args
 from ptclf.train import train
-from ptclf.util import load_settings_and_model
+from ptclf.util import load_settings_and_model, convert_vecs_to_sqlite
 
 
 def main():
@@ -39,6 +39,8 @@ def main():
         results = list(predict(settings, model, examples))
         for example, result in zip(examples, results):
             print(example, '=>', result)
+    elif args.mode == 'convert-vecs':
+        convert_vecs_to_sqlite(args.glove_path)
 
 
 if __name__ == '__main__':

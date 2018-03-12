@@ -85,7 +85,7 @@ class Tokenizer(object):
     def save(self, sqlite_con: Connection):
         """ Save tokenizer to provided sqlite database """
         config_table_create = """
-            create table if not exists tokenizer_config (
+            create table tokenizer_config (
               vocab_size integer,
               msg_len integer,
               filters text,
@@ -102,6 +102,7 @@ class Tokenizer(object):
         """
         word_indexes_insert = "insert into tokenizer_word_indexes VALUES (?, ?);"
 
+        sqlite_con.execute('drop table tokenizer_config;')
         sqlite_con.execute(config_table_create)
         sqlite_con.execute(config_insert, [
             self.vocab_size, self.msg_len, self.filters, self.lower, self.split, self.char_rnn,
