@@ -4,6 +4,7 @@ from hypothesis import strategies as s
 
 from ptclf.settings import parse_args
 from ptclf.train import train
+from ptclf.util import load_settings_and_model
 
 arg_bool = s.one_of([s.just('true'), s.just('false')])
 
@@ -11,6 +12,7 @@ arg_bool = s.one_of([s.just('true'), s.just('false')])
 def test_basic_multiclass():
     train(parse_args(['train', '-i', 'assets/sentiment.csv', '-m', 'tmp', '--verbose', '0',
                       '--validate_path', 'assets/sentiment.csv']))
+    settings, model = load_settings_and_model('tmp')
 
 
 @settings(max_examples=int(os.environ.get('RNN_TEST_DRAWS', 1)),

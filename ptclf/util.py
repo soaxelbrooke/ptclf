@@ -97,6 +97,7 @@ def load_settings_and_model(path: str, args=None) -> (Settings, 'WordRnn'):
     from ptclf.models import WordRnn
     sqlite_con = sqlite3.connect(path + '.sqlite')
     settings = Settings.load(sqlite_con)
+    settings.transients['model_path'] = path
     if args:
         settings.add_args(args)
     model = WordRnn.load(settings)
