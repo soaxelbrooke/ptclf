@@ -1,31 +1,24 @@
 [[source]]
-
 url = "https://pypi.python.org/simple"
 verify_ssl = true
 name = "pypi"
 
-
 [requires]
-
 python_version = '3.6'
 
-
 [dev-packages]
-
 ipython = "*"
 hypothesis = "*"
 
-
 [packages]
-
 toolz = "*"
 pandas = "*"
 nltk = "*"
 tqdm = "*"
-"344cdaf" = {file = "http://download.pytorch.org/whl/cu80/torch-0.3.0.post4-cp36-cp36m-linux_x86_64.whl"}
 comet-ml = "*"
 "murmurhash3" = "*"
 sklearn = "*"
 scipy = "*"
 bayesian-optimization = "*"
 pytest = "*"
+torch = "*"

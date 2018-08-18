@@ -194,7 +194,7 @@ def train_batch(model, criterion, optimizer, x, y):
         nn.utils.clip_grad_norm(model.parameters(), model.gradient_clip)
     optimizer.step()
 
-    return output, loss.data[0]
+    return output, float(loss.item())
 
 
 def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches, sle):
@@ -209,16 +209,16 @@ def score_model(settings, model, criterion, epoch, comet_experiment, dev_batches
         model.zero_grad()
         output = model(batch_x)
         loss = criterion(output, batch_y)
-        losses.append(loss.data[0])
+        losses.append(loss.item())
         seen += batch_x.size(1)
         if settings.loss_fn != 'CrossEntropy' and settings.loss_fn != 'NLL':
             accuracies.append(auroc(output, batch_y))
         else:
             accuracies.append(num_correct(output, batch_y) / batch_x.shape[1])
 
-    accuracy = numpy.mean(accuracies)
+    accuracy = float(numpy.mean(accuracies))
     period = (datetime.now() - started).total_seconds()
-    mean_loss = sum(losses) / len(losses)
+    mean_loss = float(sum(losses) / len(losses))
     sle.log_metrics(epoch, seen, {'dev_loss': mean_loss, 'epoch': epoch,
                                   'dev_acc': accuracy, 'score_per_second': seen / period},
                     force=True)

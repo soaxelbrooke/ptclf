@@ -123,13 +123,13 @@ class WordRnn(nn.Module):
 
     def init_weights(self):
         # Embedding weight init
-        nn.init.normal(self.embedding.weight)
+        nn.init.normal_(self.embedding.weight)
 
         # RNN weight init
         for layer_params in self.rnn._all_weights:
             for param in layer_params:
                 if 'weight' in param:
-                    nn.init.xavier_normal(getattr(self.rnn, param))
+                    nn.init.xavier_normal_(getattr(self.rnn, param))
 
     def forward(self, input_tensor):
         # input tensor shape: (msg_len, batch_size,)
