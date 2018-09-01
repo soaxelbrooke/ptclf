@@ -175,7 +175,7 @@ def train_epoch(settings, model, criterion, optimizer, epoch, comet_experiment, 
         epoch_period = (datetime.now() - started).total_seconds()
         comet_experiment.log_metric('train_items_per_second', seen / epoch_period)
 
-    bar.clear()
+    bar.close()
     if settings.verbose > 0:
         logging.info('Epoch: {}\tTrain accuracy: {:.3f}\tTrain loss: {:.3f}\tTrain rate: {:.3f}'
                      '\tTotal seconds: {}'.format(
