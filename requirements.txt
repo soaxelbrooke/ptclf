@@ -1,7 +1,7 @@
 atomicwrites==1.1.5
 attrs==18.1.0
 bayesian-optimization==0.6.0
-certifi==2018.8.13
+certifi==2022.12.7
 chardet==3.0.4
 comet-git-pure==0.19.6; python_version != "3.2.*"
 comet-ml==1.0.26
